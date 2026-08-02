@@ -249,30 +249,36 @@ async function ensureSession(sessionFile, title) {
 }
 
 // Run the prompt against the warm opencode server (no per-request process boot).
-// Returns the assistant's raw text reply.
-async function runAgentWarm(prompt, { agent = "jarvis", sessionFile = SESSION_FILE, title = "jarvis daemon" } = {}) {
+// Returns the assistant's raw text reply. When onDelta is given, incremental
+// reply text is pushed to it as the model generates (via /global/event).
+async function runAgentWarm(prompt, { agent = "jarvis", sessionFile = SESSION_FILE, title = "jarvis daemon", onDelta } = {}) {
   const base = await spawnOcServer();
   const sid = await ensureSession(sessionFile, title);
-  const resp = await httpJson(`${base}/session/${sid}/message`, {
-    method: "POST",
-    auth: OC_AUTH,
-    body: { agent, parts: [{ type: "text", text: prompt }] },
-    timeoutMs: 120000,
-  });
-  const text = (resp.parts || [])
-    .filter((p) => p.type === "text")
-    .map((p) => p.text || "")
-    .join(" ")
-    .trim();
-  if (!text) throw new Error("warm agent returned no text part");
-  return text;
+  const unwatch = onDelta ? watchGeneration(sid, onDelta) : null;
+  try {
+    const resp = await httpJson(`${base}/session/${sid}/message`, {
+      method: "POST",
+      auth: OC_AUTH,
+      body: { agent, parts: [{ type: "text", text: prompt }] },
+      timeoutMs: 120000,
+    });
+    const text = (resp.parts || [])
+      .filter((p) => p.type === "text")
+      .map((p) => p.text || "")
+      .join(" ")
+      .trim();
+    if (!text) throw new Error("warm agent returned no text part");
+    return text;
+  } finally {
+    if (unwatch) unwatch();
+  }
 }
 
 // Run the jarvis agent in a persistent session; returns the raw output.
-async function runAgent(prompt) {
+async function runAgent(prompt, onDelta) {
   const t0 = Date.now();
   try {
-    const out = await runAgentWarm(prompt);
+    const out = await runAgentWarm(prompt, { onDelta });
     if (process.env.JARVIS_DEBUG) console.error(`[runAgent] warm ok in ${Date.now() - t0}ms`);
     return out;
   } catch (e) {
@@ -386,12 +392,13 @@ function isTaskEscalation(s) {
 }
 
 // Full jarvis agent in voice mode (existing behavior): JSON envelope reply.
-async function runJarvisVoice(userText) {
+async function runJarvisVoice(userText, onDelta) {
   const out = await runAgent(
     `You are Jarvis in VOICE MODE. The user said: "${userText}". ` +
       `Respond conversationally and briefly (1-3 short sentences), the way a voice assistant would. ` +
       `Output ONLY a JSON object of the form {"reply": "your spoken reply"}. ` +
-      `Do NOT use any tools. Do NOT call "say". No markdown, no commentary, nothing else.`
+      `Do NOT use any tools. Do NOT call "say". No markdown, no commentary, nothing else.`,
+    onDelta
   );
   return await extractReply(out);
 }
@@ -471,16 +478,16 @@ async function speak(text) {
 
 // Turn a user utterance into a reply + piper audio. Routes chit-chat to the
 // lean jarvis-voice agent (with TASK self-escalation) and tasks to jarvis.
-async function handleUtterance(userText) {
+async function handleUtterance(userText, onDelta) {
   const t0 = Date.now();
   let agent = "jarvis";
   let reply;
   if (isTaskRequest(userText)) {
-    reply = await runJarvisVoice(userText);
+    reply = await runJarvisVoice(userText, onDelta);
   } else {
     const fast = await runFastVoice(userText);
     if (isTaskEscalation(fast)) {
-      reply = await runJarvisVoice(userText);
+      reply = await runJarvisVoice(userText, onDelta);
     } else {
       agent = "jarvis-voice";
       reply = fast;
@@ -494,6 +501,81 @@ async function handleUtterance(userText) {
     );
   }
   return { reply, audioB64: audioB64Reply };
+}
+
+// ------------------------------------------------------- streaming bridge
+
+// Active generations, keyed by opencode sessionID -> Set<onDelta> callbacks.
+// The daemon POSTs the prompt (blocking, returns the full reply) while a
+// parallel subscription to opencode's /global/event SSE channel pushes the
+// incremental text deltas to any interested client feed.
+const genWatchers = new Map();
+
+function watchGeneration(sessionID, onDelta) {
+  if (!genWatchers.has(sessionID)) genWatchers.set(sessionID, new Set());
+  const set = genWatchers.get(sessionID);
+  set.add(onDelta);
+  return () => {
+    set.delete(onDelta);
+    if (set.size === 0) genWatchers.delete(sessionID);
+  };
+}
+
+function dispatchDelta(sessionID, text) {
+  const set = genWatchers.get(sessionID);
+  if (!set) return;
+  for (const fn of [...set]) fn(text);
+}
+
+// Persistent SSE subscription to opencode's /global/event. Carries the
+// incremental assistant text (message.part.delta) that the blocking message
+// API does not expose. Reconnects forever; self-heals on server restarts.
+async function connectOcEvents() {
+  for (;;) {
+    let base;
+    try {
+      base = await spawnOcServer();
+    } catch {
+      await sleep(2000);
+      continue;
+    }
+    try {
+      const resp = await fetch(`${base}/global/event`, { headers: { Authorization: OC_AUTH } });
+      if (!resp.ok || !resp.body) throw new Error(`event http ${resp.status}`);
+      if (process.env.JARVIS_DEBUG) console.error("[events] connected to opencode /global/event");
+      let buf = "";
+      for await (const chunk of resp.body) {
+        buf += Buffer.from(chunk).toString("utf8");
+        let i;
+        while ((i = buf.indexOf("\n\n")) >= 0) {
+          const block = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          const line = block.split("\n").find((l) => l.startsWith("data:"));
+          if (!line) continue;
+          let ev;
+          try {
+            ev = JSON.parse(line.slice(5));
+          } catch {
+            continue;
+          }
+          const p = ev && ev.payload;
+          if (
+            p &&
+            p.type === "message.part.delta" &&
+            p.properties &&
+            p.properties.field === "text"
+          ) {
+            dispatchDelta(p.properties.sessionID, p.properties.delta || "");
+          }
+        }
+      }
+    } catch (e) {
+      if (process.env.JARVIS_DEBUG) {
+        console.error(`[events] connection dropped (${e.message}); reconnecting`);
+      }
+    }
+    await sleep(1000);
+  }
 }
 
 // ---------------------------------------------------------------- setup
@@ -577,6 +659,20 @@ function auth(req, res, next) {
   res.status(401).json({ error: "unauthorized" });
 }
 
+// Turn a response into an SSE stream; returns a send(obj) function.
+function sseInit(res) {
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+  return (obj) => {
+    if (res.writableEnded || res.destroyed) return;
+    try {
+      res.write(`data: ${JSON.stringify(obj)}\n\n`);
+    } catch {}
+  };
+}
+
 app.get("/api/health", (req, res) => {
   res.json({ ok: true, session: readSessionId(), voiceSession: readSessionId(VOICE_SESSION_FILE), auth: true });
 });
@@ -612,27 +708,39 @@ app.post("/api/mic/start", auth, (req, res) => {
 });
 
 app.post("/api/mic/stop", auth, async (req, res) => {
+  const send = sseInit(res);
   try {
     await stopMic();
     const userText = await transcribeFile(MIC_FILE);
-    if (!userText) return res.status(400).json({ error: "no speech detected" });
-    const { reply, audioB64 } = await handleUtterance(userText);
-    res.json({ user: userText, reply, audioB64, mime: "audio/wav" });
+    if (!userText) return send({ type: "error", message: "no speech detected" });
+    send({ type: "user", text: userText });
+    const { reply, audioB64 } = await handleUtterance(userText, (d) =>
+      send({ type: "delta", text: d })
+    );
+    send({ type: "done", reply, audioB64, mime: "audio/wav" });
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    send({ type: "error", message: String(e.message || e) });
+  } finally {
+    res.end();
   }
 });
 
 app.post("/api/ask", auth, async (req, res) => {
+  const send = sseInit(res);
   try {
     const { audioB64, text } = req.body || {};
     let userText = typeof text === "string" ? text.trim() : "";
     if (!userText && audioB64) userText = await transcribe(audioB64);
-    if (!userText) return res.status(400).json({ error: "no text or audio provided" });
-    const { reply, audioB64: audioB64Reply } = await handleUtterance(userText);
-    res.json({ user: userText, reply, audioB64: audioB64Reply, mime: "audio/wav" });
+    if (!userText) return send({ type: "error", message: "no text or audio provided" });
+    send({ type: "user", text: userText });
+    const { reply, audioB64: audioB64Reply } = await handleUtterance(userText, (d) =>
+      send({ type: "delta", text: d })
+    );
+    send({ type: "done", reply, audioB64: audioB64Reply, mime: "audio/wav" });
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    send({ type: "error", message: String(e.message || e) });
+  } finally {
+    res.end();
   }
 });
 
@@ -652,6 +760,7 @@ app.listen(PORT, "0.0.0.0", () => {
   spawnOcServer()
     .then(() => {
       if (process.env.JARVIS_DEBUG) console.error("[warm] opencode serve ready");
+      connectOcEvents();
       warmSession("jarvis", SESSION_FILE, "jarvis daemon");
       warmSession("jarvis-voice", VOICE_SESSION_FILE, VOICE_TITLE);
     })

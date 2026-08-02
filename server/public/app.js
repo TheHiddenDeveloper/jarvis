@@ -93,6 +93,64 @@ async function renderReply(userText, data) {
   await audio.play();
 }
 
+// POST an utterance and read the streaming reply. The daemon answers as SSE:
+//   {type:"user"}  -> the recognized transcript (audio input)
+//   {type:"delta"} -> incremental assistant text, rendered live
+//   {type:"done"}  -> final {reply, audioB64} once the reply is complete
+async function streamPost(url, body) {
+  const opts = {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  };
+  if (body) {
+    opts.headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  const resp = await fetch(url, opts);
+  if (resp.status === 401) return { unauthorized: true };
+  if (!resp.ok) {
+    let msg = resp.statusText;
+    try {
+      msg = (await resp.json()).error || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let data = null;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n\n")) >= 0) {
+      const block = buf.slice(0, i);
+      buf = buf.slice(i + 2);
+      const line = block.split("\n").find((l) => l.startsWith("data:"));
+      if (!line) continue;
+      let ev;
+      try {
+        ev = JSON.parse(line.slice(5));
+      } catch {
+        continue;
+      }
+      if (ev.type === "user") {
+        data = data || {};
+        data.user = ev.text;
+      } else if (ev.type === "delta") {
+        youEl.textContent = ev.text;
+      } else if (ev.type === "done") {
+        data = { ...data, ...ev };
+      } else if (ev.type === "error") {
+        throw new Error(ev.message);
+      }
+    }
+  }
+  if (!data || !data.reply) throw new Error("stream ended without a reply");
+  return data;
+}
+
 async function ask(userText) {
   setMicState("thinking");
   setStatus("thinking");
@@ -100,14 +158,8 @@ async function ask(userText) {
   youEl.classList.add("thinking");
   playChime();
   try {
-    const resp = await fetch("/api/ask", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ text: userText }),
-    });
-    if (resp.status === 401) return showToken();
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || resp.statusText);
+    const data = await streamPost("/api/ask", { text: userText });
+    if (data.unauthorized) return showToken();
     await renderReply(userText, data);
   } catch (e) {
     youEl.textContent = `Error: ${e.message}`;
@@ -130,14 +182,8 @@ async function sendAudio() {
       fr.onload = () => resolve(fr.result.split(",")[1]);
       fr.readAsDataURL(blob);
     });
-    const resp = await fetch("/api/ask", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ audioB64: b64, mime: recorder.mimeType }),
-    });
-    if (resp.status === 401) return showToken();
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || resp.statusText);
+    const data = await streamPost("/api/ask", { audioB64: b64, mime: recorder.mimeType });
+    if (data.unauthorized) return showToken();
     await renderReply(data.user, data);
   } catch (e) {
     youEl.textContent = `Error: ${e.message}`;
@@ -154,13 +200,8 @@ async function sendHostAudio() {
   youEl.classList.add("thinking");
   playChime();
   try {
-    const resp = await fetch("/api/mic/stop", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (resp.status === 401) return showToken();
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || resp.statusText);
+    const data = await streamPost("/api/mic/stop", null);
+    if (data.unauthorized) return showToken();
     await renderReply(data.user, data);
   } catch (e) {
     youEl.textContent = `Error: ${e.message}`;
