@@ -8,6 +8,8 @@ Endpoints:
                      -> {"text": "..."}
   POST /speak        body: {"text": "..."}
                      -> audio/wav bytes (base64-encoded JSON if ?json=1)
+  POST /embed        body: {"text": "..."}
+                     -> {"embed": [float, ...]} (fastembed, lazy-loaded)
   GET  /health       -> {"ok": true}
 """
 import base64
@@ -26,6 +28,7 @@ WHISPER_MODEL = os.environ.get("JARVIS_WHISPER_MODEL", "base")
 PIPER_MODEL = os.environ.get(
     "JARVIS_PIPER_MODEL", os.path.expanduser("~/jarvis/models/piper/en_US-lessac-medium.onnx")
 )
+EMBED_MODEL = os.environ.get("JARVIS_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 PORT = int(os.environ.get("JARVIS_SPEECH_PORT", "7888"))
 
 from faster_whisper import WhisperModel  # noqa: E402
@@ -35,6 +38,7 @@ whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
 voice = PiperVoice.load(PIPER_MODEL)
 
 AUDIO_LOCK = threading.Lock()
+_embed_model = None
 
 
 def transcribe(wav_bytes: bytes) -> str:
@@ -59,6 +63,16 @@ def synthesize(text: str) -> bytes:
         for c in chunks:
             wf.writeframes(c.audio_int16_bytes)
     return buf.getvalue()
+
+
+def embed(text: str):
+    """Semantic embedding for the reply cache (fastembed, lazy-loaded once)."""
+    global _embed_model
+    if _embed_model is None:
+        from fastembed import TextEmbedding
+        _embed_model = TextEmbedding(model_name=EMBED_MODEL)
+    with AUDIO_LOCK:
+        return next(iter(_embed_model.embed([text or ""]))).tolist()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -95,8 +109,11 @@ class Handler(BaseHTTPRequestHandler):
                 if as_json:
                     self._send(200, json.dumps({"wav_b64": base64.b64encode(wav).decode()}).encode(),
                                "application/json")
-                else:
-                    self._send(200, wav, "audio/wav")
+            elif self.path.startswith("/embed"):
+                n = int(self.headers.get("Content-Length", 0))
+                req = json.loads(self.rfile.read(n))
+                vec = embed(req.get("text", ""))
+                self._send(200, json.dumps({"embed": vec}).encode(), "application/json")
             else:
                 self._send(404, b"not found", "text/plain")
         except Exception as e:  # noqa: BLE001

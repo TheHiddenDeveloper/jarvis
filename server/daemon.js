@@ -41,6 +41,17 @@ const OC_PASSWORD_FILE = join(STATE_DIR, "opencode-server.password");
 // session (and the user) for the full 120s request timeout.
 const FIRST_DELTA_MS = Number(process.env.JARVIS_FIRST_DELTA_MS || 25000);
 const FAST_REPLY_MS = Number(process.env.JARVIS_FAST_REPLY_MS || 12000);
+// Semantic reply cache: repeated/near-repeated chit-chat is answered from a
+// local cache (embedding match against past replies) instead of the LLM.
+const CACHE_FILE = join(STATE_DIR, "reply-cache.json");
+const CACHE_MIN_SIM = Number(process.env.JARVIS_CACHE_MIN_SIM || 0.9);
+const CACHE_MAX = Number(process.env.JARVIS_CACHE_MAX || 200);
+const CACHE_TTL_MS = Number(process.env.JARVIS_CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
+// Opportunistic session compaction: when a session's message count exceeds
+// this, the daemon summarizes it in the background on boot (shrinks context,
+// speeds the task path). Set JARVIS_COMPACT=0 to disable.
+const COMPACT_MIN_MESSAGES = Number(process.env.JARVIS_COMPACT_MIN_MESSAGES || 80);
+const COMPACT_ENABLED = String(process.env.JARVIS_COMPACT || "1") !== "0";
 
 mkdirSync(STATE_DIR, { recursive: true });
 
@@ -520,16 +531,82 @@ function isTaskEscalation(s) {
   return normalizePlain(s).toLowerCase().replace(/[^a-z]/g, "") === "task";
 }
 
+// True when a reply has no real content (empty, punctuation-only, or the
+// generic fallback). Long tool-using turns occasionally end with a bare "..."
+// — catch that so we never speak a degenerate reply.
+function isDegenerateReply(s) {
+  const t = normalizePlain(s);
+  if (!t) return true;
+  if (t === "Sorry, I did not catch that.") return true;
+  return /^[\s.\u2026!?,;:\-]+$/.test(t);
+}
+
+// ----------------------------------------------------------------- fast path
+
+// Deterministic commands answered locally — no LLM, no tools, ~instant. Kept
+// intentionally narrow so they can't shadow a real request. Time/date used to
+// route to the full agent (task keywords), costing 8-20s; now they're free.
+function timeOfDay() {
+  const h = new Date().getHours();
+  return h < 12 ? "morning" : h < 18 ? "afternoon" : "evening";
+}
+const DET_COMMANDS = [
+  {
+    re: /\b(what('?s| is) the time|what time is it|current time|tell me the time)\b/i,
+    reply: () => {
+      const d = new Date();
+      return `It's ${d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}.`;
+    },
+  },
+  {
+    re: /\b(what('?s| is) the date|what day is it|today('?s)? date)\b/i,
+    reply: () => {
+      const d = new Date();
+      return `It's ${d.toLocaleDateString([], { weekday: "long", year: "numeric", month: "long", day: "numeric" })}.`;
+    },
+  },
+  {
+    re: /^(hi|hello|hey|hiya|yo|howdy|good morning|good afternoon|good evening)[\s!.,]*$/i,
+    reply: () => `Good ${timeOfDay()}. How can I help?`,
+  },
+  { re: /^(thanks|thank you|thank u|thx|cheers|ty)[\s!.,]*$/i, reply: () => "You're welcome." },
+  {
+    re: /\b(who are you|what('?s| is) your name|introduce yourself|are you jarvis)\b/i,
+    reply: () => "I'm Jarvis, your personal assistant. I can help with apps, files, the web, and your notes.",
+  },
+];
+
+function matchDeterministic(text) {
+  const t = text.trim();
+  for (const c of DET_COMMANDS) if (c.re.test(t)) return c;
+  return null;
+}
+
 // Full jarvis agent in voice mode (existing behavior): JSON envelope reply.
 async function runJarvisVoice(userText, onDelta) {
-  const out = await runAgent(
+  const prompt =
     `You are Jarvis in VOICE MODE. The user said: "${userText}". ` +
-      `Respond conversationally and briefly (1-3 short sentences), the way a voice assistant would. ` +
-      `Output ONLY a JSON object of the form {"reply": "your spoken reply"}. ` +
-      `Do NOT use any tools. Do NOT call "say". No markdown, no commentary, nothing else.`,
-    onDelta
-  );
-  return await extractReply(out);
+    `Respond conversationally and briefly (1-3 short sentences), the way a voice assistant would. ` +
+    `Output ONLY a JSON object of the form {"reply": "your spoken reply"}. ` +
+    `Do NOT use any tools. Do NOT call "say". No markdown, no commentary, nothing else.`;
+  let reply = await extractReply(await runAgent(prompt, onDelta));
+  if (isDegenerateReply(reply)) {
+    // The model sometimes finishes a long tool-using turn with a bare "..." and
+    // no JSON envelope. The research is already in the session, so a short
+    // reformat follow-up (seconds, not a full re-run) reliably recovers a reply.
+    if (process.env.JARVIS_DEBUG) console.error("[voice] degenerate reply; reformatting");
+    reply = await extractReply(
+      await runAgent(
+        `You were asked: "${userText}". Using your earlier work, reply conversationally and briefly (1-2 short sentences), as a voice assistant would. Output ONLY a JSON object of the form {"reply": "your spoken reply"}. No tools. No markdown, no commentary.`,
+        onDelta
+      )
+    );
+  }
+  if (isDegenerateReply(reply)) {
+    if (process.env.JARVIS_DEBUG) console.error("[voice] reformat also degenerate; graceful reply");
+    reply = "Sorry, I finished that but couldn't put it into words. Try asking again.";
+  }
+  return reply;
 }
 
 // Lean jarvis-voice agent on its own small session. Returns plain text, or
@@ -545,6 +622,10 @@ async function runFastVoice(userText) {
         `scheduling, messages, real-time data), reply with exactly the single word: TASK`,
       { agent: "jarvis-voice", sessionFile: VOICE_SESSION_FILE, title: VOICE_TITLE, replyTimeoutMs: FAST_REPLY_MS }
     );
+    if (isDegenerateReply(out)) {
+      if (process.env.JARVIS_DEBUG) console.error("[voice] fast agent returned degenerate reply; escalating");
+      return "TASK";
+    }
     return out;
   } catch (e) {
     if (e instanceof GenerationTimeoutError) {
@@ -611,21 +692,132 @@ async function speak(text) {
   return d.wav_b64;
 }
 
-// Turn a user utterance into a reply + piper audio. Routes chit-chat to the
-// lean jarvis-voice agent (with TASK self-escalation) and tasks to jarvis.
+// ------------------------------------------------------- semantic reply cache
+
+// Past chit-chat (Q -> reply) matched by embedding similarity. A hit skips the
+// LLM entirely and returns the stored reply; audio is still TTS'd fresh (fast).
+// Never consulted for task requests (those may have side effects and must not
+// replay a cached answer). All failures degrade to a miss — the cache can never
+// make a turn fail.
+let replyCache = [];
+let cacheSaveTimer = null;
+try {
+  replyCache = JSON.parse(readFileSync(CACHE_FILE, "utf8"));
+  if (!Array.isArray(replyCache)) replyCache = [];
+} catch {
+  replyCache = [];
+}
+
+async function embedText(text) {
+  try {
+    await ensureSpeech();
+    const resp = await fetch(`http://127.0.0.1:${SPEECH_PORT}/embed`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!resp.ok) return null;
+    const d = await resp.json();
+    return Array.isArray(d.embed) ? d.embed : null;
+  } catch {
+    return null;
+  }
+}
+
+function cosine(a, b) {
+  if (!a || !b || a.length !== b.length) return 0;
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  if (!na || !nb) return 0;
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+
+let lastEmbedded = null;
+async function cacheLookup(text) {
+  lastEmbedded = await embedText(text);
+  if (!lastEmbedded || replyCache.length === 0) return null;
+  let best = null;
+  let bestSim = 0;
+  const now = Date.now();
+  for (const e of replyCache) {
+    if (!e.emb) continue;
+    if (now - (e.ts || 0) > CACHE_TTL_MS) continue; // skip stale entries
+    const sim = cosine(lastEmbedded, e.emb);
+    if (sim > bestSim) {
+      bestSim = sim;
+      best = e;
+    }
+  }
+  if (best && bestSim >= CACHE_MIN_SIM) {
+    best.hits = (best.hits || 0) + 1;
+    best.ts = Date.now();
+    scheduleCacheSave();
+    if (process.env.JARVIS_DEBUG) {
+      console.error(`[cache] HIT sim=${bestSim.toFixed(3)} hits=${best.hits} q="${text}"`);
+    }
+    return best;
+  }
+  return null;
+}
+
+function scheduleCacheSave() {
+  if (cacheSaveTimer) clearTimeout(cacheSaveTimer);
+  cacheSaveTimer = setTimeout(() => {
+    cacheSaveTimer = null;
+    try {
+      writeFileSync(CACHE_FILE, JSON.stringify(replyCache), { mode: 0o600 });
+    } catch {}
+  }, 2000);
+}
+
+async function cacheStore(text, reply) {
+  const emb = await embedText(text);
+  if (!emb) return;
+  replyCache.push({ q: text, reply, emb, ts: Date.now(), hits: 1 });
+  if (replyCache.length > CACHE_MAX) {
+    replyCache.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+    replyCache = replyCache.slice(-CACHE_MAX);
+  }
+  scheduleCacheSave();
+  if (process.env.JARVIS_DEBUG) console.error(`[cache] store (${replyCache.length} entries)`);
+}
+
+// Turn a user utterance into a reply + piper audio. Routes:
+//   1. deterministic commands  -> answered locally (instant, no LLM)
+//   2. task requests           -> full jarvis agent (with streaming)
+//   3. chit-chat               -> semantic reply cache first, else lean
+//                                jarvis-voice agent (TASK self-escalation)
 async function handleUtterance(userText, onDelta) {
   const t0 = Date.now();
   let agent = "jarvis";
   let reply;
-  if (isTaskRequest(userText)) {
+  const det = matchDeterministic(userText);
+  if (det) {
+    agent = "det";
+    reply = det.reply();
+  } else if (isTaskRequest(userText)) {
     reply = await runJarvisVoice(userText, onDelta);
   } else {
-    const fast = await runFastVoice(userText);
-    if (isTaskEscalation(fast)) {
-      reply = await runJarvisVoice(userText, onDelta);
+    const cached = await cacheLookup(userText);
+    if (cached) {
+      agent = "cache";
+      reply = cached.reply;
     } else {
-      agent = "jarvis-voice";
-      reply = fast;
+      const fast = await runFastVoice(userText);
+      if (isTaskEscalation(fast)) {
+        reply = await runJarvisVoice(userText, onDelta);
+      } else {
+        agent = "jarvis-voice";
+        reply = fast;
+        if (fast !== "Sorry, I got stuck for a moment. Give me a couple of seconds and ask again.") {
+          cacheStore(userText, fast); // fire-and-forget; failures degrade to a miss
+        }
+      }
     }
   }
   const tAgent = Date.now();
@@ -805,6 +997,69 @@ async function warmSession(agent, sessionFile, title) {
   }
 }
 
+// Opportunistic background compaction: if a session has accumulated a large
+// history, summarize it (opencode's built-in compaction) to shrink the context
+// window and cut per-request latency on the task path. Runs only at boot, after
+// warming, and is disabled via JARVIS_COMPACT=0.
+async function countSessionMessages(sid) {
+  const base = await spawnOcServer();
+  let count = 0;
+  let cursor = null;
+  for (let i = 0; i < 50; i++) {
+    const url = `${base}/session/${sid}/message?limit=100${cursor ? `&before=${cursor}` : ""}`;
+    try {
+      const resp = await fetch(url, {
+        headers: { Authorization: OC_AUTH },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!resp.ok) throw new Error(`http ${resp.status}`);
+      const items = await resp.json();
+      if (!Array.isArray(items)) return count;
+      count += items.length;
+      const next = resp.headers.get("x-next-cursor");
+      if (!next || items.length === 0) return count;
+      cursor = next;
+    } catch {
+      return count;
+    }
+  }
+  return count;
+}
+
+async function maybeCompactSession(sessionFile, title) {
+  if (!COMPACT_ENABLED) return;
+  const base = await spawnOcServer();
+  const sid = await ensureSession(sessionFile, title);
+  let count;
+  try {
+    count = await countSessionMessages(sid);
+  } catch {
+    return;
+  }
+  if (count < COMPACT_MIN_MESSAGES) {
+    if (process.env.JARVIS_DEBUG) console.error(`[compact] ${title}: ${count} msgs, skip`);
+    return;
+  }
+  try {
+    const info = await httpJson(`${base}/session/${sid}`, { auth: OC_AUTH, timeoutMs: 15000 });
+    const model = info && info.model ? info.model : {};
+    const providerID = model.providerID || "opencode";
+    const modelID = model.id || "deepseek-v4-flash-free";
+    if (process.env.JARVIS_DEBUG) {
+      console.error(`[compact] ${title}: ${count} msgs -> summarizing with ${providerID}/${modelID}`);
+    }
+    await httpJson(`${base}/session/${sid}/summarize`, {
+      method: "POST",
+      auth: OC_AUTH,
+      body: { providerID, modelID, auto: false },
+      timeoutMs: 300000,
+    });
+    if (process.env.JARVIS_DEBUG) console.error(`[compact] ${title}: done`);
+  } catch (e) {
+    if (process.env.JARVIS_DEBUG) console.error(`[compact] ${title} failed: ${e.message}`);
+  }
+}
+
 // ---------------------------------------------------------------- http
 
 const app = express();
@@ -938,6 +1193,8 @@ app.listen(PORT, "0.0.0.0", () => {
       connectOcEvents();
       warmSession("jarvis", SESSION_FILE, "jarvis daemon");
       warmSession("jarvis-voice", VOICE_SESSION_FILE, VOICE_TITLE);
+      maybeCompactSession(SESSION_FILE, "jarvis daemon");
+      maybeCompactSession(VOICE_SESSION_FILE, VOICE_TITLE);
     })
     .catch((e) => console.error(`[warm] opencode serve failed: ${e.message}`));
 });
