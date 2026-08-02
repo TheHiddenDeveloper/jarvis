@@ -2,6 +2,7 @@ const mic = document.getElementById("mic");
 const hint = document.getElementById("hint");
 const statusEl = document.getElementById("status");
 const youEl = document.getElementById("you");
+const activityEl = document.getElementById("activity");
 const logEl = document.getElementById("log");
 const textbox = document.getElementById("textbox");
 const sendBtn = document.getElementById("send");
@@ -68,7 +69,18 @@ function setMicState(state) {
   if (state) mic.classList.add(state);
 }
 
+function setActivity(text) {
+  activityEl.textContent = text;
+  activityEl.classList.add("show");
+}
+
+function clearActivity() {
+  activityEl.textContent = "";
+  activityEl.classList.remove("show");
+}
+
 function setThinking(text) {
+  clearActivity();
   setMicState("thinking");
   setStatus("thinking");
   youEl.textContent = text;
@@ -83,6 +95,7 @@ function idleUI() {
   setStatus("idle");
   hint.textContent = "Tap to talk";
   stopBtn.classList.add("hidden");
+  clearActivity();
 }
 
 function resetAfterStop() {
@@ -92,6 +105,7 @@ function resetAfterStop() {
   setStatus("idle");
   hint.textContent = "Tap to talk";
   stopBtn.classList.add("hidden");
+  clearActivity();
 }
 
 // Cancel the in-flight generation: tell the daemon to abort (it closes the SSE
@@ -154,6 +168,7 @@ if (IS_LOCAL && "serviceWorker" in navigator) {
 }
 
 async function renderReply(userText, data) {
+  clearActivity();
   addMsg(userText, "user");
   addMsg(data.reply, "jarvis");
   youEl.classList.remove("thinking");
@@ -236,6 +251,8 @@ async function streamPost(url, body) {
           youEl.textContent = ev.text;
         } else if (ev.type === "done") {
           data = { ...data, ...ev };
+        } else if (ev.type === "activity") {
+          setActivity(ev.activity);
         } else if (ev.type === "cancelled") {
           data = { cancelled: true };
         } else if (ev.type === "error") {
@@ -268,6 +285,7 @@ async function ask(userText) {
     setMicState("");
     setStatus("idle");
     stopBtn.classList.add("hidden");
+    clearActivity();
   } finally {
     busy = false;
     stopRequested = false;
@@ -296,6 +314,7 @@ async function sendAudio() {
     setMicState("");
     setStatus("idle");
     stopBtn.classList.add("hidden");
+    clearActivity();
   } finally {
     busy = false;
     stopRequested = false;
@@ -318,6 +337,7 @@ async function sendHostAudio() {
     setMicState("");
     setStatus("idle");
     stopBtn.classList.add("hidden");
+    clearActivity();
   } finally {
     busy = false;
     stopRequested = false;

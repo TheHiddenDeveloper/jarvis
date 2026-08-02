@@ -146,6 +146,30 @@ main {
 }
 .you.thinking { color: var(--muted); font-style: italic; }
 
+.activity {
+  min-height: 16px;
+  font-size: 13px;
+  color: var(--muted);
+  display: none;
+  align-items: center;
+  gap: 8px;
+  max-width: 90%;
+}
+.activity.show { display: inline-flex; }
+.activity::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent-hi);
+  flex-shrink: 0;
+  animation: activityPulse 1.2s ease-in-out infinite;
+}
+@keyframes activityPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
 .logwrap {
   flex: 0 1 30%;
   display: flex;

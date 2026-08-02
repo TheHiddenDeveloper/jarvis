@@ -359,6 +359,40 @@ class GenerationCancelledError extends Error {}
 // fetch and the server-side session generation).
 let currentAbort = null;
 
+// Map an opencode tool name + input to a short, friendly activity label so
+// the UI can show what the assistant is doing without technical jargon.
+function truncateStr(s, n) {
+  const str = String(s || "").trim().replace(/\s+/g, " ");
+  return str.length > n ? str.slice(0, n - 1) + "…" : str;
+}
+
+function friendlyActivity(toolName, input) {
+  const name = String(toolName || "").toLowerCase();
+  const q = (...keys) => {
+    for (const k of keys) {
+      const v = input && input[k];
+      if (typeof v === "string" && v.trim()) return ` — "${truncateStr(v, 70)}"`;
+    }
+    return "";
+  };
+  const rules = [
+    [/(^|_)websearch$|search_web|search_code/, () => "Searching the web" + q("query", "q")],
+    [/webfetch|fetch_web/, () => "Looking at a website" + q("url")],
+    [/playwright_browser/, () => "Using a browser" + q("url")],
+    [/vault_search|vault_search_semantic|vault_read|vault_context|memory_search|memory_read/, () => "Reading your notes" + (q("query", "note", "topic") || q("note"))],
+    [/vault_write|vault_log|memory_write/, () => "Updating your notes" + q("note", "topic")],
+    [/read_text_file|read_file/, () => "Opening a file" + q("path", "file_path")],
+    [/write_file|edit_file|(^|_)edit$|(^|_)write$/, () => "Editing a file" + q("path", "file_path")],
+    [/search_files|directory_tree|list_directory|(^|_)glob$|(^|_)grep$/, () => "Looking through your files" + (q("path", "pattern") || q("path"))],
+    [/^bash$|^exec|shell/, () => "Running a command on your computer"],
+    [/^github_/, () => "Checking GitHub"],
+    [/(^|_)notify$/, () => "Sending you a notification"],
+    [/(^|_)say$|tts/, () => "Speaking"],
+  ];
+  for (const [re, fn] of rules) if (re.test(name)) return fn();
+  return "Working on that";
+}
+
 // Run the prompt against the warm opencode server (no per-request process boot).
 // Returns the assistant's raw text reply. When onDelta is given, incremental
 // reply text is pushed to it as the model generates (via /global/event).
@@ -367,7 +401,7 @@ let currentAbort = null;
 // aborted on the server (POST /session/:id/abort) and GenerationTimeoutError
 // is thrown — this bounds worst-case waits instead of letting a stuck model
 // hold the session for the full 120s.
-async function runAgentWarm(prompt, { agent = "jarvis", sessionFile = SESSION_FILE, title = "jarvis daemon", onDelta, firstDeltaMs = 0, replyTimeoutMs = 0 } = {}) {
+async function runAgentWarm(prompt, { agent = "jarvis", sessionFile = SESSION_FILE, title = "jarvis daemon", onDelta, firstDeltaMs = 0, replyTimeoutMs = 0, onActivity } = {}) {
   const base = await spawnOcServer();
   const sid = await ensureSession(sessionFile, title);
   const ctrl = new AbortController();
@@ -377,6 +411,44 @@ async function runAgentWarm(prompt, { agent = "jarvis", sessionFile = SESSION_FI
   let gotFirst = false;
   let timedOut = false;
   let timer = null;
+  let activityTimer = null;
+  const seenCalls = new Set();
+  let pollN = 0;
+  if (onActivity) {
+    // Live activity feed: opencode does not stream tool calls, but the
+    // in-flight assistant message (GET /session/{id}/message) carries tool
+    // parts while the step is running. Poll it and surface each new tool call
+    // as a friendly progress label. Pruned after completion, so poll live.
+    activityTimer = setInterval(async () => {
+      try {
+        const resp = await httpJson(`${base}/session/${sid}/message?limit=3`, {
+          auth: OC_AUTH,
+          timeoutMs: 5000,
+        });
+        const msgs = Array.isArray(resp) ? resp : (resp.messages || []);
+        if (process.env.JARVIS_DEBUG && !pollN) {
+          console.error(`[activity] msgs=${msgs.length} kinds=[${msgs.map((m) => (m.parts || []).map((p) => p.type).join("|")).join(" ; ")}]`);
+        }
+        pollN = (pollN + 1) % 8;
+        for (const msg of msgs) {
+          if (!msg || !Array.isArray(msg.parts)) continue;
+          for (const part of msg.parts) {
+            if (part.type !== "tool" || !part.callID || seenCalls.has(part.callID)) continue;
+            const input = part.state && part.state.input;
+            const hasInput = !!input && typeof input === "object" && Object.keys(input).length > 0;
+            if (!hasInput) continue;
+            seenCalls.add(part.callID);
+            if (process.env.JARVIS_DEBUG) {
+              console.error(`[activity] tool=${part.tool} input=${JSON.stringify(input).slice(0, 150)}`);
+            }
+            onActivity(friendlyActivity(part.tool, input));
+          }
+        }
+      } catch (e) {
+        if (process.env.JARVIS_DEBUG) console.error(`[activity] poll error: ${e.message}`);
+      }
+    }, 250);
+  }
   const unwatch = onDelta
     ? watchGeneration(sid, (d) => {
         if (!gotFirst) {
@@ -422,15 +494,16 @@ async function runAgentWarm(prompt, { agent = "jarvis", sessionFile = SESSION_FI
   } finally {
     if (currentAbort === info) currentAbort = null;
     if (timer) clearTimeout(timer);
+    if (activityTimer) clearInterval(activityTimer);
     if (unwatch) unwatch();
   }
 }
 
 // Run the jarvis agent in a persistent session; returns the raw output.
-async function runAgent(prompt, onDelta) {
+async function runAgent(prompt, onDelta, onActivity) {
   const t0 = Date.now();
   try {
-    const out = await runAgentWarm(prompt, { onDelta, firstDeltaMs: FIRST_DELTA_MS });
+    const out = await runAgentWarm(prompt, { onDelta, firstDeltaMs: FIRST_DELTA_MS, onActivity });
     if (process.env.JARVIS_DEBUG) console.error(`[runAgent] warm ok in ${Date.now() - t0}ms`);
     return out;
   } catch (e) {
@@ -596,14 +669,19 @@ function matchDeterministic(text) {
   return null;
 }
 
-// Full jarvis agent in voice mode (existing behavior): JSON envelope reply.
-async function runJarvisVoice(userText, onDelta) {
+// Full jarvis agent in voice mode: for task requests the assistant actually
+// uses tools (web, notes, files, commands) so replies are accurate and the
+// client progress feed has real steps to show. Replies keep the JSON envelope.
+async function runJarvisVoice(userText, onDelta, onActivity) {
   const prompt =
     `You are Jarvis in VOICE MODE. The user said: "${userText}". ` +
-    `Respond conversationally and briefly (1-3 short sentences), the way a voice assistant would. ` +
-    `Output ONLY a JSON object of the form {"reply": "your spoken reply"}. ` +
-    `Do NOT use any tools. Do NOT call "say". No markdown, no commentary, nothing else.`;
-  let reply = await extractReply(await runAgent(prompt, onDelta));
+    `If the request needs up-to-date information or an action, actually use a tool ` +
+    `(websearch, webfetch, vault_read, memory_read, filesystem_read_text_file, or bash) ` +
+    `to get it done — do not answer from memory or guess when a tool can verify. ` +
+    `Once you have the answer, respond conversationally and briefly (1-3 short sentences), ` +
+    `the way a voice assistant would. Output ONLY a JSON object of the form {"reply": "your spoken reply"} ` +
+    `as your final message. Do NOT call "say". No markdown, no commentary in the final message.`;
+  let reply = await extractReply(await runAgent(prompt, onDelta, onActivity));
   if (isDegenerateReply(reply)) {
     // The model sometimes finishes a long tool-using turn with a bare "..." and
     // no JSON envelope. The research is already in the session, so a short
@@ -612,7 +690,8 @@ async function runJarvisVoice(userText, onDelta) {
     reply = await extractReply(
       await runAgent(
         `You were asked: "${userText}". Using your earlier work, reply conversationally and briefly (1-2 short sentences), as a voice assistant would. Output ONLY a JSON object of the form {"reply": "your spoken reply"}. No tools. No markdown, no commentary.`,
-        onDelta
+        onDelta,
+        onActivity
       )
     );
   }
@@ -807,7 +886,7 @@ async function cacheStore(text, reply) {
 //   2. task requests           -> full jarvis agent (with streaming)
 //   3. chit-chat               -> semantic reply cache first, else lean
 //                                jarvis-voice agent (TASK self-escalation)
-async function handleUtterance(userText, onDelta) {
+async function handleUtterance(userText, onDelta, onActivity) {
   const t0 = Date.now();
   let agent = "jarvis";
   let reply;
@@ -816,7 +895,7 @@ async function handleUtterance(userText, onDelta) {
     agent = "det";
     reply = det.reply();
   } else if (isTaskRequest(userText)) {
-    reply = await runJarvisVoice(userText, onDelta);
+    reply = await runJarvisVoice(userText, onDelta, onActivity);
   } else {
     const cached = await cacheLookup(userText);
     if (cached) {
@@ -825,7 +904,7 @@ async function handleUtterance(userText, onDelta) {
     } else {
       const fast = await runFastVoice(userText);
       if (isTaskEscalation(fast)) {
-        reply = await runJarvisVoice(userText, onDelta);
+        reply = await runJarvisVoice(userText, onDelta, onActivity);
       } else {
         agent = "jarvis-voice";
         reply = fast;
@@ -865,12 +944,18 @@ function enqueueUtterance(fn) {
 
 // Accumulate streamed deltas server-side so the client shows the growing
 // reply (not individual chunks) and stays correct across SSE reconnects.
+// Also relays the live activity feed (friendly "what the assistant is doing"
+// labels) as {type:"activity"} events.
 function handleUtteranceStream(userText, send) {
   let acc = "";
-  return handleUtterance(userText, (d) => {
-    acc += d;
-    send({ type: "delta", text: acc });
-  });
+  return handleUtterance(
+    userText,
+    (d) => {
+      acc += d;
+      send({ type: "delta", text: acc });
+    },
+    (activity) => send({ type: "activity", activity })
+  );
 }
 
 // ------------------------------------------------------- streaming bridge

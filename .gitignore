@@ -25,3 +25,5 @@ models/
 
 # OS junk
 .DS_Store
+
+.playwright-mcp/
