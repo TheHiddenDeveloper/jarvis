@@ -10,7 +10,7 @@
     "frontendDist": "http://127.0.0.1:7878/?v=3"
   },
   "app": {
-    "withGlobalTauri": false,
+    "withGlobalTauri": true,
     "windows": [
       {
         "label": "main",

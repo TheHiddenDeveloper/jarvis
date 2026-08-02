@@ -19,7 +19,14 @@
         <span class="logo" data-tauri-drag-region>◉</span>
         <h1 data-tauri-drag-region>Jarvis</h1>
       </div>
-      <div class="status" id="status" data-tauri-drag-region>idle</div>
+      <div class="header-right" data-tauri-drag-region>
+        <button id="stop" class="stop hidden" aria-label="Stop Jarvis" title="Stop">■</button>
+        <span class="status" id="status">idle</span>
+        <div class="win" id="win">
+          <button id="winMin" aria-label="Minimize" title="Minimize">–</button>
+          <button id="winClose" aria-label="Close" title="Close">✕</button>
+        </div>
+      </div>
     </header>
 
     <main>
@@ -33,7 +40,12 @@
       <p class="you" id="you"></p>
     </main>
 
-    <section class="log" id="log"></section>
+    <section class="logwrap">
+      <div class="loghead">
+        <button id="clearLog" class="clear hidden" aria-label="Clear conversation" title="Clear conversation">Clear</button>
+      </div>
+      <div class="log" id="log"></div>
+    </section>
 
     <footer class="textin">
       <input id="textbox" type="text" placeholder="Or type a request…" autocomplete="off" />

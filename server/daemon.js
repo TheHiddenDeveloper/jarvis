@@ -350,6 +350,15 @@ async function ensureSession(sessionFile, title) {
 // reply at all). The caller decides how to degrade.
 class GenerationTimeoutError extends Error {}
 
+// Thrown when the user cancels the in-flight generation (POST /api/abort).
+// Must propagate past runAgent/runFastVoice so a cancel is a cancel — it must
+// never trigger an escalation or a CLI re-run.
+class GenerationCancelledError extends Error {}
+
+// The active user-facing generation, so /api/abort can stop it (both the local
+// fetch and the server-side session generation).
+let currentAbort = null;
+
 // Run the prompt against the warm opencode server (no per-request process boot).
 // Returns the assistant's raw text reply. When onDelta is given, incremental
 // reply text is pushed to it as the model generates (via /global/event).
@@ -362,6 +371,8 @@ async function runAgentWarm(prompt, { agent = "jarvis", sessionFile = SESSION_FI
   const base = await spawnOcServer();
   const sid = await ensureSession(sessionFile, title);
   const ctrl = new AbortController();
+  const info = { ctrl, sid, cancelled: false };
+  currentAbort = info;
   const budget = onDelta ? firstDeltaMs : replyTimeoutMs;
   let gotFirst = false;
   let timedOut = false;
@@ -405,9 +416,11 @@ async function runAgentWarm(prompt, { agent = "jarvis", sessionFile = SESSION_FI
     if (!text) throw new Error("warm agent returned no text part");
     return text;
   } catch (e) {
+    if (info.cancelled) throw new GenerationCancelledError("generation cancelled");
     if (timedOut) throw new GenerationTimeoutError("generation exceeded its time budget");
     throw e;
   } finally {
+    if (currentAbort === info) currentAbort = null;
     if (timer) clearTimeout(timer);
     if (unwatch) unwatch();
   }
@@ -422,6 +435,7 @@ async function runAgent(prompt, onDelta) {
     return out;
   } catch (e) {
     if (e instanceof GenerationTimeoutError) throw e; // don't compound the wait with a CLI fallback
+    if (e instanceof GenerationCancelledError) throw e; // a cancel must not re-run
     if (process.env.JARVIS_DEBUG) {
       console.error(`[runAgent] warm failed (${e.message}); falling back to CLI`);
     }
@@ -628,6 +642,7 @@ async function runFastVoice(userText) {
     }
     return out;
   } catch (e) {
+    if (e instanceof GenerationCancelledError) throw e;
     if (e instanceof GenerationTimeoutError) {
       if (process.env.JARVIS_DEBUG) console.error("[voice] fast agent timed out; replying gracefully");
       return "Sorry, I got stuck for a moment. Give me a couple of seconds and ask again.";
@@ -1107,6 +1122,25 @@ app.get("/api/health", (req, res) => {
   res.json({ ok: true, session: readSessionId(), voiceSession: readSessionId(VOICE_SESSION_FILE), auth: true });
 });
 
+// Cancel the in-flight generation (user hit Stop / Esc). Stops both the local
+// fetch and the server-side session generation so the next turn starts clean.
+app.post("/api/abort", auth, async (req, res) => {
+  const cur = currentAbort;
+  if (!cur) return res.json({ aborted: false });
+  cur.cancelled = true;
+  cur.ctrl.abort();
+  try {
+    const base = await spawnOcServer();
+    await httpJson(`${base}/session/${cur.sid}/abort`, {
+      method: "POST",
+      auth: OC_AUTH,
+      timeoutMs: 10000,
+    });
+  } catch {}
+  if (process.env.JARVIS_DEBUG) console.error("[abort] cancelled in-flight generation");
+  res.json({ aborted: true });
+});
+
 // Reflex chime, public (it's just a sound).
 app.get("/chime.wav", (req, res) => {
   if (!existsSync(CHIME_FILE)) return res.status(404).end();
@@ -1149,6 +1183,7 @@ app.post("/api/mic/stop", auth, async (req, res) => {
       send({ type: "done", reply, audioB64, mime: "audio/wav" });
     });
   } catch (e) {
+    if (e instanceof GenerationCancelledError) return send({ type: "cancelled" });
     send({ type: "error", message: friendlyError(e) });
   } finally {
     res.end();
@@ -1168,6 +1203,7 @@ app.post("/api/ask", auth, async (req, res) => {
       send({ type: "done", reply, audioB64: audioB64Reply, mime: "audio/wav" });
     });
   } catch (e) {
+    if (e instanceof GenerationCancelledError) return send({ type: "cancelled" });
     send({ type: "error", message: friendlyError(e) });
   } finally {
     res.end();

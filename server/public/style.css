@@ -45,6 +45,41 @@ header:active { cursor: grabbing; }
 .logo { color: var(--accent); font-size: 20px; }
 h1 { font-size: 18px; font-weight: 600; }
 
+.header-right { display: flex; align-items: center; gap: 8px; }
+
+.stop {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 1px solid var(--ring);
+  background: transparent;
+  color: var(--ring);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  -webkit-tap-highlight-color: transparent;
+}
+.stop:hover { background: rgba(255, 77, 77, 0.12); }
+.stop.hidden { display: none; }
+
+.win { display: none; gap: 6px; }
+.has-tauri .win { display: flex; }
+.win button {
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  border: 1px solid #2a2f3a;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+.win button:hover { color: var(--text); }
+#winClose:hover { color: var(--ring); border-color: var(--ring); }
+
 .status {
   font-size: 12px;
   text-transform: uppercase;
@@ -111,8 +146,31 @@ main {
 }
 .you.thinking { color: var(--muted); font-style: italic; }
 
-.log {
+.logwrap {
   flex: 0 1 30%;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 0;
+}
+.loghead { display: flex; justify-content: flex-end; }
+.clear {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 2px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.clear:hover { color: var(--text); }
+.clear.hidden { display: none; }
+
+.log {
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
