@@ -37,6 +37,10 @@ const RESUME_TIMEOUT_MS = Number(process.env.JARVIS_RESUME_TIMEOUT || 60000);
 const SPEECH_PORT = Number(process.env.JARVIS_SPEECH_PORT || 7888);
 const OC_PORT = Number(process.env.JARVIS_OPENCODE_PORT || 4096);
 const OC_PASSWORD_FILE = join(STATE_DIR, "opencode-server.password");
+// Watchdog budgets: bound worst-case waits so a stuck model can't hold a
+// session (and the user) for the full 120s request timeout.
+const FIRST_DELTA_MS = Number(process.env.JARVIS_FIRST_DELTA_MS || 25000);
+const FAST_REPLY_MS = Number(process.env.JARVIS_FAST_REPLY_MS || 12000);
 
 mkdirSync(STATE_DIR, { recursive: true });
 
@@ -119,16 +123,15 @@ function runOpencode(args, timeoutMs = 180000) {
 
 // ---------------------------------------------------------------- warm servers
 
-let speechProc = null;
-let ocProc = null;
-
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function httpJson(url, { method = "GET", body, auth, timeoutMs = 10000 } = {}) {
+async function httpJson(url, { method = "GET", body, auth, timeoutMs = 10000, signal } = {}) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  // Merge an external abort signal (e.g. a watchdog) with the timeout.
+  const sig = signal ? AbortSignal.any([signal, ctrl.signal]) : ctrl.signal;
   try {
     const resp = await fetch(url, {
       method,
@@ -137,7 +140,7 @@ async function httpJson(url, { method = "GET", body, auth, timeoutMs = 10000 } =
         ...(body ? { "Content-Type": "application/json" } : {}),
       },
       body: body ? JSON.stringify(body) : undefined,
-      signal: ctrl.signal,
+      signal: sig,
     });
     if (!resp.ok) throw new Error(`http ${resp.status} ${url}`);
     return await resp.json();
@@ -146,19 +149,76 @@ async function httpJson(url, { method = "GET", body, auth, timeoutMs = 10000 } =
   }
 }
 
+// Simple circuit breaker: after maxFailures consecutive failures the breaker
+// opens for openMs, during which calls fail fast instead of hammering the
+// service (or waiting out long boot deadlines) on every request.
+function createBreaker({ maxFailures = 3, openMs = 15000 } = {}) {
+  let failures = 0;
+  let openedAt = null;
+  return {
+    ok() {
+      failures = 0;
+      openedAt = null;
+    },
+    fail() {
+      if (openedAt) return;
+      failures++;
+      if (failures >= maxFailures) openedAt = Date.now();
+    },
+    isOpen() {
+      if (openedAt && Date.now() - openedAt >= openMs) {
+        openedAt = null;
+        failures = 0; // half-open: allow one probe through
+      }
+      return openedAt !== null;
+    },
+  };
+}
+
+class ServiceUnavailableError extends Error {}
+
+let speechProc = null;
+let ocProc = null;
+let ocHealthyAt = 0;
+let speechHealthyAt = 0;
+const ocBreaker = createBreaker();
+const speechBreaker = createBreaker();
+
 // Ensure the warm opencode serve process is up; returns its base URL.
-async function spawnOcServer() {
+//   force: bypass the circuit breaker + health memo (used by the background
+//          event loop so a crashed server is respawned promptly).
+// On the request path a recently-confirmed health check is reused (no
+// round-trip), and when the breaker is open the call fails fast.
+async function spawnOcServer({ force = false } = {}) {
   const base = `http://127.0.0.1:${OC_PORT}`;
+  if (!force) {
+    if (ocBreaker.isOpen()) throw new ServiceUnavailableError("opencode serve is temporarily unavailable");
+    if (ocProc && ocProc.exitCode === null && Date.now() - ocHealthyAt < 5000) return base;
+  }
   if (ocProc && ocProc.exitCode === null) {
     try {
       const r = await fetch(`${base}/health`, {
         headers: { Authorization: OC_AUTH },
         signal: AbortSignal.timeout(2000),
       });
-      if (r.ok) return base;
+      if (r.ok) {
+        ocHealthyAt = Date.now();
+        ocBreaker.ok();
+        return base;
+      }
+      ocBreaker.fail();
     } catch {
-      /* fall through to respawn */
+      ocBreaker.fail();
     }
+    if (!force && ocBreaker.isOpen()) {
+      throw new ServiceUnavailableError("opencode serve is temporarily unavailable");
+    }
+  }
+  // (Re)spawn: kill a hung process so the port frees up, then boot fresh.
+  if (ocProc && ocProc.exitCode === null) {
+    try {
+      ocProc.kill("SIGKILL");
+    } catch {}
   }
   ocProc = spawn(OPENCODE, ["serve", "--port", String(OC_PORT), "--hostname", "127.0.0.1"], {
     cwd: SERVER_DIR,
@@ -175,23 +235,45 @@ async function spawnOcServer() {
         headers: { Authorization: OC_AUTH },
         signal: AbortSignal.timeout(2000),
       });
-      if (r.ok) return base;
+      if (r.ok) {
+        ocHealthyAt = Date.now();
+        ocBreaker.ok();
+        return base;
+      }
     } catch {}
     await sleep(500);
   }
-  throw new Error("opencode serve did not become healthy");
+  ocBreaker.fail();
+  throw new ServiceUnavailableError("opencode serve did not become healthy");
 }
 
 // Ensure the warm speech server (whisper + piper) is up.
-async function ensureSpeech() {
+async function ensureSpeech({ force = false } = {}) {
   const base = `http://127.0.0.1:${SPEECH_PORT}`;
+  if (!force) {
+    if (speechBreaker.isOpen()) throw new ServiceUnavailableError("speech server is temporarily unavailable");
+    if (speechProc && speechProc.exitCode === null && Date.now() - speechHealthyAt < 5000) return;
+  }
   if (speechProc && speechProc.exitCode === null) {
     try {
       const r = await fetch(`${base}/health`, { signal: AbortSignal.timeout(2000) });
-      if (r.ok) return;
+      if (r.ok) {
+        speechHealthyAt = Date.now();
+        speechBreaker.ok();
+        return;
+      }
+      speechBreaker.fail();
     } catch {
-      /* fall through to respawn */
+      speechBreaker.fail();
     }
+    if (!force && speechBreaker.isOpen()) {
+      throw new ServiceUnavailableError("speech server is temporarily unavailable");
+    }
+  }
+  if (speechProc && speechProc.exitCode === null) {
+    try {
+      speechProc.kill("SIGKILL");
+    } catch {}
   }
   speechProc = spawn(VENV_PY, [join(JARVIS_DIR, "scripts", "speech-server.py")], {
     stdio: ["ignore", "pipe", "pipe"],
@@ -203,11 +285,16 @@ async function ensureSpeech() {
   while (Date.now() < deadline) {
     try {
       const r = await fetch(`${base}/health`, { signal: AbortSignal.timeout(2000) });
-      if (r.ok) return;
+      if (r.ok) {
+        speechHealthyAt = Date.now();
+        speechBreaker.ok();
+        return;
+      }
     } catch {}
     await sleep(500);
   }
-  throw new Error("speech server did not become healthy");
+  speechBreaker.fail();
+  throw new ServiceUnavailableError("speech server did not become healthy");
 }
 
 // ---------------------------------------------------------------- helpers
@@ -248,19 +335,56 @@ async function ensureSession(sessionFile, title) {
   return sid;
 }
 
+// Thrown when a generation exceeds its watchdog budget (no first delta, or no
+// reply at all). The caller decides how to degrade.
+class GenerationTimeoutError extends Error {}
+
 // Run the prompt against the warm opencode server (no per-request process boot).
 // Returns the assistant's raw text reply. When onDelta is given, incremental
 // reply text is pushed to it as the model generates (via /global/event).
-async function runAgentWarm(prompt, { agent = "jarvis", sessionFile = SESSION_FILE, title = "jarvis daemon", onDelta } = {}) {
+// Watchdog: if firstDeltaMs is set and no delta arrives in time, or if
+// replyTimeoutMs is set and no reply arrives in time, the generation is
+// aborted on the server (POST /session/:id/abort) and GenerationTimeoutError
+// is thrown — this bounds worst-case waits instead of letting a stuck model
+// hold the session for the full 120s.
+async function runAgentWarm(prompt, { agent = "jarvis", sessionFile = SESSION_FILE, title = "jarvis daemon", onDelta, firstDeltaMs = 0, replyTimeoutMs = 0 } = {}) {
   const base = await spawnOcServer();
   const sid = await ensureSession(sessionFile, title);
-  const unwatch = onDelta ? watchGeneration(sid, onDelta) : null;
+  const ctrl = new AbortController();
+  const budget = onDelta ? firstDeltaMs : replyTimeoutMs;
+  let gotFirst = false;
+  let timedOut = false;
+  let timer = null;
+  const unwatch = onDelta
+    ? watchGeneration(sid, (d) => {
+        if (!gotFirst) {
+          gotFirst = true;
+          if (timer) {
+            clearTimeout(timer);
+            timer = null;
+          }
+        }
+        onDelta(d);
+      })
+    : null;
+  if (budget > 0) {
+    timer = setTimeout(() => {
+      timedOut = true;
+      ctrl.abort();
+      httpJson(`${base}/session/${sid}/abort`, {
+        method: "POST",
+        auth: OC_AUTH,
+        timeoutMs: 10000,
+      }).catch(() => {});
+    }, budget);
+  }
   try {
     const resp = await httpJson(`${base}/session/${sid}/message`, {
       method: "POST",
       auth: OC_AUTH,
       body: { agent, parts: [{ type: "text", text: prompt }] },
       timeoutMs: 120000,
+      signal: ctrl.signal,
     });
     const text = (resp.parts || [])
       .filter((p) => p.type === "text")
@@ -269,7 +393,11 @@ async function runAgentWarm(prompt, { agent = "jarvis", sessionFile = SESSION_FI
       .trim();
     if (!text) throw new Error("warm agent returned no text part");
     return text;
+  } catch (e) {
+    if (timedOut) throw new GenerationTimeoutError("generation exceeded its time budget");
+    throw e;
   } finally {
+    if (timer) clearTimeout(timer);
     if (unwatch) unwatch();
   }
 }
@@ -278,10 +406,11 @@ async function runAgentWarm(prompt, { agent = "jarvis", sessionFile = SESSION_FI
 async function runAgent(prompt, onDelta) {
   const t0 = Date.now();
   try {
-    const out = await runAgentWarm(prompt, { onDelta });
+    const out = await runAgentWarm(prompt, { onDelta, firstDeltaMs: FIRST_DELTA_MS });
     if (process.env.JARVIS_DEBUG) console.error(`[runAgent] warm ok in ${Date.now() - t0}ms`);
     return out;
   } catch (e) {
+    if (e instanceof GenerationTimeoutError) throw e; // don't compound the wait with a CLI fallback
     if (process.env.JARVIS_DEBUG) {
       console.error(`[runAgent] warm failed (${e.message}); falling back to CLI`);
     }
@@ -404,7 +533,9 @@ async function runJarvisVoice(userText, onDelta) {
 }
 
 // Lean jarvis-voice agent on its own small session. Returns plain text, or
-// exactly "TASK" when the request actually needs the full agent.
+// exactly "TASK" when the request actually needs the full agent. A reply that
+// exceeds FAST_REPLY_MS is aborted and replaced with a graceful line instead
+// of leaving the user waiting on a stuck model.
 async function runFastVoice(userText) {
   try {
     const out = await runAgentWarm(
@@ -412,10 +543,14 @@ async function runFastVoice(userText) {
         `Reply in at most 2 short spoken sentences, plain text only, no markdown, no emojis, no JSON. ` +
         `If the request needs any action or info beyond your own knowledge (apps, files, web, system, ` +
         `scheduling, messages, real-time data), reply with exactly the single word: TASK`,
-      { agent: "jarvis-voice", sessionFile: VOICE_SESSION_FILE, title: VOICE_TITLE }
+      { agent: "jarvis-voice", sessionFile: VOICE_SESSION_FILE, title: VOICE_TITLE, replyTimeoutMs: FAST_REPLY_MS }
     );
     return out;
   } catch (e) {
+    if (e instanceof GenerationTimeoutError) {
+      if (process.env.JARVIS_DEBUG) console.error("[voice] fast agent timed out; replying gracefully");
+      return "Sorry, I got stuck for a moment. Give me a couple of seconds and ask again.";
+    }
     if (process.env.JARVIS_DEBUG) {
       console.error(`[voice] fast agent failed (${e.message}); escalating to jarvis`);
     }
@@ -494,13 +629,41 @@ async function handleUtterance(userText, onDelta) {
     }
   }
   const tAgent = Date.now();
-  const audioB64Reply = await speak(reply);
+  let audioB64Reply = "";
+  try {
+    audioB64Reply = await speak(reply);
+  } catch (e) {
+    // Degradation tier: if TTS fails we still deliver the text reply; the
+    // client shows it without audio instead of the whole turn failing.
+    if (process.env.JARVIS_DEBUG) console.error(`[utter] TTS failed: ${e.message}`);
+  }
   if (process.env.JARVIS_DEBUG) {
     console.error(
       `[utter] agent=${agent} llm=${tAgent - t0}ms tts=${Date.now() - tAgent}ms total=${Date.now() - t0}ms`
     );
   }
   return { reply, audioB64: audioB64Reply };
+}
+
+// Serialize utterance handling: only one turn is processed at a time, so two
+// overlapping requests can't double-fire the same warm session (opencode
+// serves a per-session busy lock, but queueing here is deterministic and keeps
+// the single-user widget from tripping over itself).
+let utteranceChain = Promise.resolve();
+function enqueueUtterance(fn) {
+  const run = utteranceChain.then(fn, fn);
+  utteranceChain = run.catch(() => {});
+  return run;
+}
+
+// Accumulate streamed deltas server-side so the client shows the growing
+// reply (not individual chunks) and stays correct across SSE reconnects.
+function handleUtteranceStream(userText, send) {
+  let acc = "";
+  return handleUtterance(userText, (d) => {
+    acc += d;
+    send({ type: "delta", text: acc });
+  });
 }
 
 // ------------------------------------------------------- streaming bridge
@@ -534,7 +697,7 @@ async function connectOcEvents() {
   for (;;) {
     let base;
     try {
-      base = await spawnOcServer();
+      base = await spawnOcServer({ force: true });
     } catch {
       await sleep(2000);
       continue;
@@ -673,6 +836,18 @@ function sseInit(res) {
   };
 }
 
+// Map internal failures to user-facing messages (stability: never leak raw
+// stack/URL noise, and give actionable text for the common failure modes).
+function friendlyError(e) {
+  if (e instanceof GenerationTimeoutError) {
+    return "That one took too long — I've stopped it. Try asking again.";
+  }
+  if (e instanceof ServiceUnavailableError) {
+    return "Jarvis's brain is restarting — give me a moment and try again.";
+  }
+  return String(e.message || e);
+}
+
 app.get("/api/health", (req, res) => {
   res.json({ ok: true, session: readSessionId(), voiceSession: readSessionId(VOICE_SESSION_FILE), auth: true });
 });
@@ -710,16 +885,16 @@ app.post("/api/mic/start", auth, (req, res) => {
 app.post("/api/mic/stop", auth, async (req, res) => {
   const send = sseInit(res);
   try {
-    await stopMic();
-    const userText = await transcribeFile(MIC_FILE);
-    if (!userText) return send({ type: "error", message: "no speech detected" });
-    send({ type: "user", text: userText });
-    const { reply, audioB64 } = await handleUtterance(userText, (d) =>
-      send({ type: "delta", text: d })
-    );
-    send({ type: "done", reply, audioB64, mime: "audio/wav" });
+    await enqueueUtterance(async () => {
+      await stopMic();
+      const userText = await transcribeFile(MIC_FILE);
+      if (!userText) return send({ type: "error", message: "no speech detected" });
+      send({ type: "user", text: userText });
+      const { reply, audioB64 } = await handleUtteranceStream(userText, send);
+      send({ type: "done", reply, audioB64, mime: "audio/wav" });
+    });
   } catch (e) {
-    send({ type: "error", message: String(e.message || e) });
+    send({ type: "error", message: friendlyError(e) });
   } finally {
     res.end();
   }
@@ -732,13 +907,13 @@ app.post("/api/ask", auth, async (req, res) => {
     let userText = typeof text === "string" ? text.trim() : "";
     if (!userText && audioB64) userText = await transcribe(audioB64);
     if (!userText) return send({ type: "error", message: "no text or audio provided" });
-    send({ type: "user", text: userText });
-    const { reply, audioB64: audioB64Reply } = await handleUtterance(userText, (d) =>
-      send({ type: "delta", text: d })
-    );
-    send({ type: "done", reply, audioB64: audioB64Reply, mime: "audio/wav" });
+    await enqueueUtterance(async () => {
+      send({ type: "user", text: userText });
+      const { reply, audioB64: audioB64Reply } = await handleUtteranceStream(userText, send);
+      send({ type: "done", reply, audioB64: audioB64Reply, mime: "audio/wav" });
+    });
   } catch (e) {
-    send({ type: "error", message: String(e.message || e) });
+    send({ type: "error", message: friendlyError(e) });
   } finally {
     res.end();
   }

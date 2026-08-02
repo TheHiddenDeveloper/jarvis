@@ -80,6 +80,15 @@ if (IS_LOCAL && "serviceWorker" in navigator) {
 async function renderReply(userText, data) {
   addMsg(userText, "user");
   addMsg(data.reply, "jarvis");
+  youEl.classList.remove("thinking");
+  youEl.textContent = "";
+  if (!data.audioB64) {
+    // TTS failed on the daemon side: show the text reply, skip speech.
+    setMicState("");
+    setStatus("idle");
+    hint.textContent = "Tap to talk";
+    return;
+  }
   setMicState("speaking");
   setStatus("speaking");
   const audio = new Audio(`data:audio/wav;base64,${data.audioB64}`);
@@ -88,8 +97,6 @@ async function renderReply(userText, data) {
     setStatus("idle");
     hint.textContent = "Tap to talk";
   };
-  youEl.classList.remove("thinking");
-  youEl.textContent = "";
   await audio.play();
 }
 
