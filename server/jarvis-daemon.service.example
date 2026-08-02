@@ -1,0 +1,20 @@
+# Jarvis daemon — systemd user service.
+# Install:  cp jarvis-daemon.service ~/.config/systemd/user/
+# Replace YOUR_USER and YOUR_HOME below.
+[Unit]
+Description=Jarvis voice assistant daemon
+After=sound.target pipewire.socket
+
+[Service]
+Type=simple
+ExecStart=<YOUR_HOME>/.local/share/fnm/node-versions/v24.13.0/installation/bin/node <YOUR_HOME>/jarvis/server/daemon.js
+WorkingDirectory=<YOUR_HOME>/jarvis/server
+Environment=NODE_ENV=production
+Environment=PATH=<YOUR_HOME>/.opencode/bin:<YOUR_HOME>/.local/share/fnm/node-versions/v24.13.0/installation/bin:/usr/local/bin:/usr/bin:/bin
+Environment=JARVIS_DEBUG=1
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Jarvis",
+  "version": "0.1.0",
+  "identifier": "dev.jarvis.desktop",
+  "build": {
+    "beforeDevCommand": "",
+    "devUrl": "http://127.0.0.1:7878/?v=3",
+    "beforeBuildCommand": "",
+    "frontendDist": "http://127.0.0.1:7878/?v=3"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Jarvis",
+        "width": 380,
+        "height": 620,
+        "minWidth": 340,
+        "minHeight": 480,
+        "resizable": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": false,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png"
+    ]
+  }
+}

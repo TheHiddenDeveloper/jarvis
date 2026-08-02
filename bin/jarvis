@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# jarvis — command-line front door to the Jarvis agent.
+#
+# Usage:
+#   jarvis "do something"      one-shot task
+#   jarvis                     interactive session (chat)
+#   jarvis --voice             spoken conversation (mic → Whisper → reply via TTS)
+#
+# Wraps: opencode run --agent jarvis
+
+set -euo pipefail
+
+OPENCODE_BIN="${OPENCODE_BIN:-opencode}"
+
+usage() {
+  sed -n '2,8p' "$0"
+  exit "${1:-0}"
+}
+
+case "${1:-}" in
+  -h|--help) usage ;;
+  -i|--interactive) exec "$OPENCODE_BIN" run --agent jarvis --interactive ;;
+  --voice) exec "$HOME/jarvis/bin/voice-loop.sh" ;;
+esac
+
+if [ "$#" -eq 0 ]; then
+  usage
+fi
+
+exec "$OPENCODE_BIN" run --agent jarvis "$@"

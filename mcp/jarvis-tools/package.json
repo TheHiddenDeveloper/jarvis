@@ -1,0 +1,14 @@
+{
+  "name": "jarvis-tools",
+  "version": "0.1.0",
+  "description": "Jarvis local hands: desktop control, screenshots+OCR, clipboard, notifications, TTS, memory",
+  "type": "module",
+  "private": true,
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}

@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f1115" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+  <title>Jarvis</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div id="app">
+    <header>
+      <div class="brand">
+        <span class="logo">◉</span>
+        <h1>Jarvis</h1>
+      </div>
+      <div class="status" id="status">idle</div>
+    </header>
+
+    <main>
+      <button id="mic" class="mic" aria-label="Talk to Jarvis">
+        <svg viewBox="0 0 24 24" width="40" height="40" fill="currentColor">
+          <path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z"/>
+          <path d="M19 11a1 1 0 1 0-2 0 5 5 0 0 1-10 0 1 1 0 1 0-2 0 7 7 0 0 0 6 6.92V20H8a1 1 0 1 0 0 2h8a1 1 0 1 0 0-2h-3v-2.08A7 7 0 0 0 19 11z"/>
+        </svg>
+      </button>
+      <p class="hint" id="hint">Tap to talk</p>
+      <p class="you" id="you"></p>
+    </main>
+
+    <section class="log" id="log"></section>
+
+    <footer class="textin">
+      <input id="textbox" type="text" placeholder="Or type a request…" autocomplete="off" />
+      <button id="send" aria-label="Send">➤</button>
+    </footer>
+  </div>
+
+  <div id="tokenModal" class="modal hidden">
+    <div class="modal-box">
+      <h2>Connect to Jarvis</h2>
+      <p>Enter the API token shown when you start <code>jarvis-daemon</code>.</p>
+      <input id="tokenInput" type="password" placeholder="API token" />
+      <button id="tokenSave">Connect</button>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

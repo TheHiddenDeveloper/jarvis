@@ -1,0 +1,12 @@
+{
+  "name": "jarvis-daemon",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node daemon.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

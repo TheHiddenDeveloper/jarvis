@@ -1,0 +1,12 @@
+# Jarvis widget — KDE autostart entry.
+# Install:  cp jarvis-widget.desktop ~/.config/autostart/
+# Replace YOUR_HOME below. Use KDE autostart, NOT systemd (no Wayland env in service context).
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Jarvis Widget
+Comment=Always-on-top Jarvis assistant widget
+Exec=<YOUR_HOME>/jarvis/bin/widget.sh
+Icon=<YOUR_HOME>/jarvis/widget/icons/icon.png
+Terminal=false
+X-GNOME-Autostart-enabled=true

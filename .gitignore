@@ -1,0 +1,27 @@
+# Secrets — never commit
+.env
+*.env
+
+# Runtime state (server.token, session id, mic capture)
+state/
+
+# Screenshots / debug logs
+.screenshots/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+mcp/**/node_modules/
+
+# Rust / Tauri build artifacts
+widget/target/
+
+# Piper models (re-downloaded on setup)
+models/
+
+# OS junk
+.DS_Store

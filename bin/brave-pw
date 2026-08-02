@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Playwright launcher for flatpak Brave. Playwright spawns this wrapper with
+# Chromium-compatible flags; we forward them into the flatpak sandbox.
+exec flatpak run com.brave.Browser "$@"
