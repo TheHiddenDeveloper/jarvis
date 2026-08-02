@@ -25,7 +25,9 @@ This is the central context file for the Jarvis personal assistant. It tells the
   - `filesystem` — file read/write/search across allowed roots.
   - `playwright` — browser automation (research, forms, downloads).
   - `jarvis-tools` — desktop control (typing/keys, screenshots + OCR, clipboard), notifications, TTS, memory access.
-- **Memory:** `~/jarvis/memory/` — persistent knowledge. Read the protocol in `memory/README.md`.
+- **Memory — two layers:**
+  - **Canonical brain:** the Obsidian vault at `~/Ideaverse` (knowledge base). Tools: `vault_read`, `vault_search`, `vault_search_semantic` (local embeddings, meaning-based), `vault_write`, `vault_context`, `vault_log`. Run `vault_context` at session start; `vault_log` after completing work there.
+  - **Fast layer:** `~/jarvis/memory/` (operational state). Tools: `memory_read/write/search`. Reference vault notes rather than duplicating them.
 - **Front doors:** CLI (`jarvis` command), scheduled cron jobs, remote web UI, voice (Phase 2+).
 
 ## Operating Rules
@@ -50,12 +52,12 @@ This is the central context file for the Jarvis personal assistant. It tells the
 ## Useful Machine Facts
 
 - Home has: `Dev/`, `Documents/`, `Downloads/`, `Nextcloud/`, `Ideaverse/` (Obsidian notes), `develop/`, `code/`, `go/`.
-- Obsidian vault `Ideaverse/` is running — the human's notes live there.
+- Obsidian vault `Ideaverse/` is running — the human's notes live there. It is the canonical long-term brain; `~/jarvis/memory/` is the fast-access layer.
 - Nextcloud is running as a service.
 - A Gileara business platform project lives in `~/Dev/gileara-biz-platform`.
 
 ## Session Checklist
 
-1. Read this file. Read `memory/README.md` and skim `memory/`.
-2. Load relevant memory topics for the task.
-3. Act. Verify. Store important outcomes back to memory.
+1. Read this file. Run `vault_context` to restore vault state. Read `memory/README.md` and skim `memory/`.
+2. Load relevant memory topics and vault notes for the task (`memory_read`, `vault_read`, `vault_search`).
+3. Act. Verify. Store important outcomes: `vault_write`/`vault_log` for knowledge, `memory_write` for operational state.

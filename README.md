@@ -24,6 +24,12 @@ A local, self-hosted assistant for the Hidden Developer's machine. Built on open
 │   · serves the PWA (server/public/)                      │
 │   · REST API: text ask, mic capture, loopback token      │
 │   · speaks replies via piper (neural TTS)                │
+├─────────────────────────────────────────────────────────┤
+│  Warm servers (spawned + kept alive by the daemon):     │
+│   · scripts/speech-server.py (:7888)                     │
+│     whisper ASR + piper TTS loaded ONCE in one process  │
+│   · opencode serve (:4096, password-gated)               │
+│     hot opencode agent — no per-request process boot    │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -52,7 +58,8 @@ Or open the web UI / desktop widget: daemon serves `http://localhost:7878`.
 | `mcp/playwright/` | Browser automation MCP |
 | `server/` | Node/express daemon + PWA (`server/public/`) |
 | `scripts/setup-deps.sh` | System dependency installer (Manjaro/Arch) |
-| `scripts/transcribe.py` | faster-whisper transcription |
+| `scripts/transcribe.py` | faster-whisper transcription (one-shot) |
+| `scripts/speech-server.py` | Warm ASR+TTS server: whisper + piper loaded once, HTTP (`:7888`) |
 | `widget/` | Tauri 2 desktop widget (frameless, always-on-top) |
 
 ## Setup on another PC
@@ -67,14 +74,18 @@ sudo pacman -S --needed ffmpeg espeak-ng
 # Tauri widget: cargo, webkit2gtk-4.1, gtk3, libsoup3, librsvg
 ```
 
-### 2. Voice env (Python venv)
+### 2. Voice + memory env (Python venv)
 
 ```sh
 python -m venv ~/jarvis/venv
-~/jarvis/venv/bin/pip install faster-whisper piper-tts
+~/jarvis/venv/bin/pip install faster-whisper piper-tts fastembed
 # piper model → ~/jarvis/models/piper/ (en_US-lessac-medium.onnx, ~63MB)
 export HF_HUB_DISABLE_XET=1     # required — the xet downloader hangs otherwise
 ```
+
+`fastembed` powers semantic memory search (`vault_search_semantic`): local ONNX embeddings
+(bge-small-en-v1.5, ~130MB download on first use) over the Obsidian vault at `~/Ideaverse`.
+Index is incremental (by file mtime) and lives in `state/vault-index.json` (gitignored).
 
 ### 3. Daemon + PWA
 
@@ -112,6 +123,8 @@ cd ~/jarvis/widget && cargo build --release
 ## Operational notes (hard-won)
 
 - The daemon runs opencode via `spawn` with `stdio:['ignore','pipe','pipe']` — **never `exec`** (hangs at init). Sessions are cwd-bound; the agent prompt must forbid tools (else it hangs detached).
+- **Latency is kept low by warm servers.** `opencode run -s <id>` hangs (60s+) when the daemon cwd doesn't match the session's `directory` — so the daemon talks to one hot `opencode serve` process over HTTP instead (`POST /session/{id}/message`, basic-auth from `state/opencode-server.password`), and to the warm speech server for ASR/TTS. Cold spawn is only a fallback. Measured end-to-end: text ~2.4s, voice ~3.7s (conversational).
+- `opencode run --attach` still boots the full client (~11s) — not a latency win; the HTTP API is.
 - Mic capture is **daemon-side** on the widget: WebKitGTK has no permission-request handler, so `getUserMedia` is always denied on Linux. Use `POST /api/mic/start` + `/api/mic/stop` (ffmpeg pulse capture, 60s auto-stop).
 - `GET /api/token` returns the auth token **only on loopback** — widget/local browser auto-provisions; a remote phone gets 403 and must be given the token.
 - Service worker is **network-first** (jarvis-v2). A cache-first SW served stale JS and broke the widget; the SW self-unregisters on loopback and the widget pins `?v=3`.

@@ -37,7 +37,9 @@ header {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  cursor: grab;
 }
+header:active { cursor: grabbing; }
 
 .brand { display: flex; align-items: center; gap: 8px; }
 .logo { color: var(--accent); font-size: 20px; }

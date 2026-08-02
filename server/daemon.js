@@ -24,12 +24,16 @@ const PUBLIC_DIR = join(JARVIS_DIR, "server", "public");
 const SESSION_FILE = join(STATE_DIR, "server-session.id");
 const TOKEN_FILE = join(STATE_DIR, "server.token");
 const VENV_PY = join(JARVIS_DIR, "venv/bin/python");
-const TRANSCRIBE = join(JARVIS_DIR, "scripts/transcribe.py");
 const OPENCODE = process.env.OPENCODE_BIN || "opencode";
-const PIPER = process.env.JARVIS_PIPER || join(JARVIS_DIR, "venv/bin/piper");
-const PIPER_MODEL =
-  process.env.JARVIS_PIPER_MODEL || join(JARVIS_DIR, "models/piper/en_US-lessac-medium.onnx");
 const PORT = Number(process.env.JARVIS_PORT || 7878);
+// Resuming an existing session takes a while; if it yields nothing (e.g. the
+// session's directory no longer matches our cwd) we drop the id and retry fresh
+// rather than burning the full agent timeout.
+const RESUME_TIMEOUT_MS = Number(process.env.JARVIS_RESUME_TIMEOUT || 60000);
+// Warm helper servers the daemon spawns and keeps alive (no per-request cold starts):
+const SPEECH_PORT = Number(process.env.JARVIS_SPEECH_PORT || 7888);
+const OC_PORT = Number(process.env.JARVIS_OPENCODE_PORT || 4096);
+const OC_PASSWORD_FILE = join(STATE_DIR, "opencode-server.password");
 
 mkdirSync(STATE_DIR, { recursive: true });
 
@@ -40,6 +44,14 @@ function getToken() {
   return token;
 }
 const TOKEN = process.env.JARVIS_API_TOKEN || getToken();
+
+function getOcPassword() {
+  if (existsSync(OC_PASSWORD_FILE)) return readFileSync(OC_PASSWORD_FILE, "utf8").trim();
+  const p = randomBytes(16).toString("hex");
+  writeFileSync(OC_PASSWORD_FILE, p, { mode: 0o600 });
+  return p;
+}
+const OC_AUTH = "Basic " + Buffer.from(`opencode:${getOcPassword()}`).toString("base64");
 
 const SERVER_DIR = join(JARVIS_DIR, "server");
 const MIC_FILE = join(STATE_DIR, "host-mic.wav");
@@ -102,6 +114,99 @@ function runOpencode(args, timeoutMs = 180000) {
   });
 }
 
+// ---------------------------------------------------------------- warm servers
+
+let speechProc = null;
+let ocProc = null;
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function httpJson(url, { method = "GET", body, auth, timeoutMs = 10000 } = {}) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, {
+      method,
+      headers: {
+        ...(auth ? { Authorization: auth } : {}),
+        ...(body ? { "Content-Type": "application/json" } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: ctrl.signal,
+    });
+    if (!resp.ok) throw new Error(`http ${resp.status} ${url}`);
+    return await resp.json();
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// Ensure the warm opencode serve process is up; returns its base URL.
+async function spawnOcServer() {
+  const base = `http://127.0.0.1:${OC_PORT}`;
+  if (ocProc && ocProc.exitCode === null) {
+    try {
+      const r = await fetch(`${base}/health`, {
+        headers: { Authorization: OC_AUTH },
+        signal: AbortSignal.timeout(2000),
+      });
+      if (r.ok) return base;
+    } catch {
+      /* fall through to respawn */
+    }
+  }
+  ocProc = spawn(OPENCODE, ["serve", "--port", String(OC_PORT), "--hostname", "127.0.0.1"], {
+    cwd: SERVER_DIR,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, OPENCODE_SERVER_PASSWORD: getOcPassword() },
+  });
+  ocProc.on("exit", () => {
+    ocProc = null;
+  });
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    try {
+      const r = await fetch(`${base}/health`, {
+        headers: { Authorization: OC_AUTH },
+        signal: AbortSignal.timeout(2000),
+      });
+      if (r.ok) return base;
+    } catch {}
+    await sleep(500);
+  }
+  throw new Error("opencode serve did not become healthy");
+}
+
+// Ensure the warm speech server (whisper + piper) is up.
+async function ensureSpeech() {
+  const base = `http://127.0.0.1:${SPEECH_PORT}`;
+  if (speechProc && speechProc.exitCode === null) {
+    try {
+      const r = await fetch(`${base}/health`, { signal: AbortSignal.timeout(2000) });
+      if (r.ok) return;
+    } catch {
+      /* fall through to respawn */
+    }
+  }
+  speechProc = spawn(VENV_PY, [join(JARVIS_DIR, "scripts", "speech-server.py")], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  speechProc.on("exit", () => {
+    speechProc = null;
+  });
+  const deadline = Date.now() + 45000;
+  while (Date.now() < deadline) {
+    try {
+      const r = await fetch(`${base}/health`, { signal: AbortSignal.timeout(2000) });
+      if (r.ok) return;
+    } catch {}
+    await sleep(500);
+  }
+  throw new Error("speech server did not become healthy");
+}
+
 // ---------------------------------------------------------------- helpers
 
 function readSessionId() {
@@ -123,17 +228,63 @@ async function findSessionId(title) {
   return id;
 }
 
+// Run the prompt against the warm opencode server (no per-request process boot).
+// Returns the assistant's raw text reply.
+async function runAgentWarm(prompt) {
+  const base = await spawnOcServer();
+  let sid = readSessionId();
+  if (!sid) {
+    const s = await httpJson(`${base}/session`, {
+      method: "POST",
+      auth: OC_AUTH,
+      body: { directory: SERVER_DIR, title: "jarvis daemon" },
+      timeoutMs: 20000,
+    });
+    sid = s.id;
+    writeFileSync(SESSION_FILE, sid);
+  }
+  const resp = await httpJson(`${base}/session/${sid}/message`, {
+    method: "POST",
+    auth: OC_AUTH,
+    body: { agent: "jarvis", parts: [{ type: "text", text: prompt }] },
+    timeoutMs: 120000,
+  });
+  const text = (resp.parts || [])
+    .filter((p) => p.type === "text")
+    .map((p) => p.text || "")
+    .join(" ")
+    .trim();
+  if (!text) throw new Error("warm agent returned no text part");
+  return text;
+}
+
 // Run the jarvis agent in a persistent session; returns the raw output.
 async function runAgent(prompt) {
-  let sid = readSessionId();
-  let args;
-  if (sid) {
-    args = ["run", "-s", sid, "--agent", "jarvis", prompt];
-  } else {
-    args = ["run", "--agent", "jarvis", "--title", "jarvis daemon", prompt];
+  const t0 = Date.now();
+  try {
+    const out = await runAgentWarm(prompt);
+    if (process.env.JARVIS_DEBUG) console.error(`[runAgent] warm ok in ${Date.now() - t0}ms`);
+    return out;
+  } catch (e) {
+    if (process.env.JARVIS_DEBUG) {
+      console.error(`[runAgent] warm failed (${e.message}); falling back to CLI`);
+    }
   }
-  if (process.env.JARVIS_DEBUG) console.error(`[runAgent] opencode ${args.slice(0, 4).join(" ")}`);
-  const out = await runOpencode(args);
+  let sid = readSessionId();
+  if (sid) {
+    const out = await runOpencode(["run", "-s", sid, "--agent", "jarvis", prompt], RESUME_TIMEOUT_MS);
+    if (out.trim()) return out;
+    // Resume produced nothing (hung session, moved directory, corrupt state).
+    // Drop the stale id and fall back to a fresh session so the user gets a reply.
+    if (process.env.JARVIS_DEBUG) {
+      console.error(`[runAgent] resume of ${sid} empty after ${Date.now() - t0}ms; retrying fresh`);
+    }
+    try {
+      unlinkSync(SESSION_FILE);
+    } catch {}
+    sid = null;
+  }
+  const out = await runOpencode(["run", "--agent", "jarvis", "--title", "jarvis daemon", prompt]);
   if (!sid) await findSessionId("jarvis daemon");
   return out;
 }
@@ -192,20 +343,37 @@ function extractReply(out) {
   return meaningful[meaningful.length - 1] || "Sorry, I did not catch that.";
 }
 
+async function transcribeBytes(wavBytes) {
+  await ensureSpeech();
+  const resp = await fetch(`http://127.0.0.1:${SPEECH_PORT}/transcribe`, {
+    method: "POST",
+    headers: { "Content-Type": "audio/wav" },
+    body: wavBytes,
+    signal: AbortSignal.timeout(60000),
+  });
+  if (!resp.ok) throw new Error(`speech /transcribe ${resp.status}`);
+  const d = await resp.json();
+  return (d.text || "").trim();
+}
+
 async function transcribeFile(wavPath) {
-  const { stdout } = await execFileAsync(VENV_PY, [TRANSCRIBE, wavPath], { timeout: 180000 });
-  return stdout.trim();
+  return await transcribeBytes(readFileSync(wavPath));
 }
 
 async function transcribe(audioB64) {
   const raw = join(STATE_DIR, "upload.bin");
   const wav = join(STATE_DIR, "upload.wav");
   writeFileSync(raw, Buffer.from(audioB64, "base64"));
+  const t0 = Date.now();
   try {
     await execFileAsync("ffmpeg", ["-y", "-i", raw, "-ar", "16000", "-ac", "1", wav], {
       timeout: 30000,
     });
-    return await transcribeFile(wav);
+    const text = await transcribeBytes(readFileSync(wav));
+    if (process.env.JARVIS_DEBUG) {
+      console.error(`[transcribe] ${Date.now() - t0}ms -> "${text}"`);
+    }
+    return text;
   } finally {
     for (const f of [raw, wav]) {
       try {
@@ -216,32 +384,35 @@ async function transcribe(audioB64) {
 }
 
 async function speak(text) {
-  const txt = join(STATE_DIR, "reply.txt");
-  const wav = join(STATE_DIR, "reply.wav");
-  writeFileSync(txt, text);
-  try {
-    await execFileAsync(PIPER, ["--model", PIPER_MODEL, "--input_file", txt, "--output_file", wav], {
-      timeout: 30000,
-    });
-    return readFileSync(wav).toString("base64");
-  } finally {
-    for (const f of [txt, wav]) {
-      try {
-        unlinkSync(f);
-      } catch {}
-    }
-  }
+  await ensureSpeech();
+  const resp = await fetch(`http://127.0.0.1:${SPEECH_PORT}/speak?json=1`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+    signal: AbortSignal.timeout(30000),
+  });
+  if (!resp.ok) throw new Error(`speech /speak ${resp.status}`);
+  const d = await resp.json();
+  return d.wav_b64;
 }
 
 // Turn a user utterance into a reply + piper audio (voice-mode prompt).
 async function handleUtterance(userText) {
-  const reply = await extractReply(await runAgent(
+  const t0 = Date.now();
+  const out = await runAgent(
     `You are Jarvis in VOICE MODE. The user said: "${userText}". ` +
       `Respond conversationally and briefly (1-3 short sentences), the way a voice assistant would. ` +
       `Output ONLY a JSON object of the form {"reply": "your spoken reply"}. ` +
       `Do NOT use any tools. Do NOT call "say". No markdown, no commentary, nothing else.`
-  ));
+  );
+  const tAgent = Date.now();
+  const reply = await extractReply(out);
   const audioB64Reply = await speak(reply);
+  if (process.env.JARVIS_DEBUG) {
+    console.error(
+      `[utter] agent=${tAgent - t0}ms tts=${Date.now() - tAgent}ms total=${Date.now() - t0}ms`
+    );
+  }
   return { reply, audioB64: audioB64Reply };
 }
 
@@ -320,4 +491,15 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`  Local URL:  http://localhost:${PORT}`);
   console.log(`  API token:  ${TOKEN}`);
   console.log(`  (token also in ${TOKEN_FILE}; pass in Authorization: Bearer <token>)`);
+  // Warm the helper servers in the background so the first request is fast.
+  ensureSpeech()
+    .then(() => {
+      if (process.env.JARVIS_DEBUG) console.error("[warm] speech server ready");
+    })
+    .catch((e) => console.error(`[warm] speech server failed: ${e.message}`));
+  spawnOcServer()
+    .then(() => {
+      if (process.env.JARVIS_DEBUG) console.error("[warm] opencode serve ready");
+    })
+    .catch((e) => console.error(`[warm] opencode serve failed: ${e.message}`));
 });
