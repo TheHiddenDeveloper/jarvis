@@ -18,6 +18,17 @@ let stream = null;
 let chunks = [];
 let recording = false;
 
+let chimeAudio = null;
+
+function playChime() {
+  try {
+    if (chimeAudio) chimeAudio.pause();
+    chimeAudio = new Audio("/chime.wav?t=" + Date.now());
+    chimeAudio.volume = 0.8;
+    chimeAudio.play().catch(() => {});
+  } catch {}
+}
+
 function setStatus(name) {
   statusEl.textContent = name;
   statusEl.className = "status";
@@ -87,6 +98,7 @@ async function ask(userText) {
   setStatus("thinking");
   youEl.textContent = "Thinking…";
   youEl.classList.add("thinking");
+  playChime();
   try {
     const resp = await fetch("/api/ask", {
       method: "POST",
@@ -110,6 +122,7 @@ async function sendAudio() {
   setStatus("thinking");
   youEl.textContent = "Listening to you…";
   youEl.classList.add("thinking");
+  playChime();
   try {
     const blob = new Blob(chunks, { type: recorder.mimeType });
     const b64 = await new Promise((resolve) => {
@@ -139,6 +152,7 @@ async function sendHostAudio() {
   setStatus("thinking");
   youEl.textContent = "Listening to you…";
   youEl.classList.add("thinking");
+  playChime();
   try {
     const resp = await fetch("/api/mic/stop", {
       method: "POST",

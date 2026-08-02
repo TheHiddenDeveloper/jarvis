@@ -13,6 +13,7 @@ A local, self-hosted assistant for the Hidden Developer's machine. Built on open
 │         · AGENTS.md machine profile                      │
 │         · memory/ persistent knowledge                   │
 │         · agents/jarvis.md operating rules + perms       │
+│         · agents/jarvis-voice.md lean fast-path agent    │
 ├─────────────────────────────────────────────────────────┤
 │  Hands (MCP servers):                                   │
 │   · filesystem   — file read/write/search               │
@@ -126,6 +127,7 @@ cd ~/jarvis/widget && cargo build --release
 - **Latency is kept low by warm servers.** `opencode run -s <id>` hangs (60s+) when the daemon cwd doesn't match the session's `directory` — so the daemon talks to one hot `opencode serve` process over HTTP instead (`POST /session/{id}/message`, basic-auth from `state/opencode-server.password`), and to the warm speech server for ASR/TTS. Cold spawn is only a fallback. Measured end-to-end: text ~2.4s, voice ~3.7s (conversational).
 - `opencode run --attach` still boots the full client (~11s) — not a latency win; the HTTP API is.
 - Mic capture is **daemon-side** on the widget: WebKitGTK has no permission-request handler, so `getUserMedia` is always denied on Linux. Use `POST /api/mic/start` + `/api/mic/stop` (ffmpeg pulse capture, 60s auto-stop).
+- **Voice replies are routed.** Pattern classifier sends tasks (apps/files/web/system) to the full `jarvis` agent; casual chit-chat goes to the lean `jarvis-voice` agent (own warm session, tiny prompt, no tools) for faster replies. If `jarvis-voice` decides a request needs real action it replies `TASK` and the daemon escalates to `jarvis`. Both sessions are warmed (message + revert) at boot so MCP/models are pre-loaded. The client plays a reflex chime (`/chime.wav`, generated at boot) the instant the user submits, so there is no dead silence while the reply generates.
 - `GET /api/token` returns the auth token **only on loopback** — widget/local browser auto-provisions; a remote phone gets 403 and must be given the token.
 - Service worker is **network-first** (jarvis-v2). A cache-first SW served stale JS and broke the widget; the SW self-unregisters on loopback and the widget pins `?v=3`.
 - Phone voice needs HTTPS (tailscale cert) — `getUserMedia` requires a secure context. Text works over HTTP.

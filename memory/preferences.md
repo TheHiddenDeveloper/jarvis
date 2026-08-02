@@ -13,3 +13,5 @@
 - [2026-08-02] Opening VS Code: use the `code .` command (code + space + dot) in a terminal from the working directory to open VS Code in that directory. Do NOT use kde-open on a folder — that opens the folder, not the app. (Learned 2026-08-02)
 
 - [2026-08-02] User wants Jarvis to use Obsidian (Ideaverse vault at ~/Ideaverse) as its "brain" going forward — read/write/search notes there as long-term knowledge base. (2026-08-02)
+
+- [2026-08-02] 2026-08-02: RESEARCH WORKFLOW — Whenever Destiny asks for research, use either the embedded (filesystem/jarvis) tools or Playwright browser tools, but Playwright takes precedence over everything else for research tasks.

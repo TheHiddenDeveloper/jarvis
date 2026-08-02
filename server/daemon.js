@@ -13,7 +13,7 @@ import { promisify } from "node:util";
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
@@ -22,6 +22,9 @@ const JARVIS_DIR = join(HOME, "jarvis");
 const STATE_DIR = join(JARVIS_DIR, "state");
 const PUBLIC_DIR = join(JARVIS_DIR, "server", "public");
 const SESSION_FILE = join(STATE_DIR, "server-session.id");
+const VOICE_SESSION_FILE = join(STATE_DIR, "voice-session.id");
+const VOICE_TITLE = "jarvis voice";
+const CHIME_FILE = join(STATE_DIR, "chime.wav");
 const TOKEN_FILE = join(STATE_DIR, "server.token");
 const VENV_PY = join(JARVIS_DIR, "venv/bin/python");
 const OPENCODE = process.env.OPENCODE_BIN || "opencode";
@@ -209,9 +212,9 @@ async function ensureSpeech() {
 
 // ---------------------------------------------------------------- helpers
 
-function readSessionId() {
-  if (existsSync(SESSION_FILE)) {
-    const id = readFileSync(SESSION_FILE, "utf8").trim();
+function readSessionId(file = SESSION_FILE) {
+  if (existsSync(file)) {
+    const id = readFileSync(file, "utf8").trim();
     if (id) return id;
   }
   return null;
@@ -228,25 +231,32 @@ async function findSessionId(title) {
   return id;
 }
 
-// Run the prompt against the warm opencode server (no per-request process boot).
-// Returns the assistant's raw text reply.
-async function runAgentWarm(prompt) {
+// Ensure a warm session exists (create on demand) and return its id.
+async function ensureSession(sessionFile, title) {
   const base = await spawnOcServer();
-  let sid = readSessionId();
+  let sid = readSessionId(sessionFile);
   if (!sid) {
     const s = await httpJson(`${base}/session`, {
       method: "POST",
       auth: OC_AUTH,
-      body: { directory: SERVER_DIR, title: "jarvis daemon" },
+      body: { directory: SERVER_DIR, title },
       timeoutMs: 20000,
     });
     sid = s.id;
-    writeFileSync(SESSION_FILE, sid);
+    writeFileSync(sessionFile, sid);
   }
+  return sid;
+}
+
+// Run the prompt against the warm opencode server (no per-request process boot).
+// Returns the assistant's raw text reply.
+async function runAgentWarm(prompt, { agent = "jarvis", sessionFile = SESSION_FILE, title = "jarvis daemon" } = {}) {
+  const base = await spawnOcServer();
+  const sid = await ensureSession(sessionFile, title);
   const resp = await httpJson(`${base}/session/${sid}/message`, {
     method: "POST",
     auth: OC_AUTH,
-    body: { agent: "jarvis", parts: [{ type: "text", text: prompt }] },
+    body: { agent, parts: [{ type: "text", text: prompt }] },
     timeoutMs: 120000,
   });
   const text = (resp.parts || [])
@@ -343,6 +353,69 @@ function extractReply(out) {
   return meaningful[meaningful.length - 1] || "Sorry, I did not catch that.";
 }
 
+// ------------------------------------------------------------ voice routing
+
+// Utterances matching these patterns need the full jarvis agent (tools/MCP);
+// everything else can take the lean jarvis-voice fast path.
+const TASK_RE = [
+  /\b(open|launch|start|run|play|close|quit|kill)\b.*\b(spotify|vscode|code|chrome|brave|firefox|obsidian|kate|gedit|telegram|whatsapp|slack|discord|gimp|krita|terminal|konsole|files|dolphin|nautilus|steam|browser|app)\b/,
+  /\b(search|look up|look for|google|find|research|check|fetch|browse|navigate)\b/,
+  /\b(create|make|write|edit|delete|remove|rename|move|copy|organize|convert|download|upload|save|backup|clean)\b.*\b(file|folder|directory|document|note|image|video|music|playlist|pdf|script|tab)\b/,
+  /\b(install|uninstall|update|upgrade)\b/,
+  /\b(restart|reboot|shutdown|sleep|lock|power off)\b/,
+  /\b(volume|brightness|screenshot|notification|notify|remind|reminder|timer|alarm|schedule|calendar|email|message|call)\b/,
+  /\b(weather|forecast|temperature|wifi|bluetooth|network|time|date)\b/,
+];
+
+function isTaskRequest(text) {
+  const t = text.toLowerCase();
+  return TASK_RE.some((re) => re.test(t));
+}
+
+function normalizePlain(s) {
+  let t = s.trim();
+  t = t.replace(/^```[a-z]*\s*/i, "").replace(/\s*```$/i, "").trim();
+  if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
+    t = t.slice(1, -1).trim();
+  }
+  return t.replace(/\s+/g, " ").trim();
+}
+
+function isTaskEscalation(s) {
+  return normalizePlain(s).toLowerCase().replace(/[^a-z]/g, "") === "task";
+}
+
+// Full jarvis agent in voice mode (existing behavior): JSON envelope reply.
+async function runJarvisVoice(userText) {
+  const out = await runAgent(
+    `You are Jarvis in VOICE MODE. The user said: "${userText}". ` +
+      `Respond conversationally and briefly (1-3 short sentences), the way a voice assistant would. ` +
+      `Output ONLY a JSON object of the form {"reply": "your spoken reply"}. ` +
+      `Do NOT use any tools. Do NOT call "say". No markdown, no commentary, nothing else.`
+  );
+  return await extractReply(out);
+}
+
+// Lean jarvis-voice agent on its own small session. Returns plain text, or
+// exactly "TASK" when the request actually needs the full agent.
+async function runFastVoice(userText) {
+  try {
+    const out = await runAgentWarm(
+      `[Fast voice mode] Today is ${new Date().toDateString()}. The user said: "${userText}". ` +
+        `Reply in at most 2 short spoken sentences, plain text only, no markdown, no emojis, no JSON. ` +
+        `If the request needs any action or info beyond your own knowledge (apps, files, web, system, ` +
+        `scheduling, messages, real-time data), reply with exactly the single word: TASK`,
+      { agent: "jarvis-voice", sessionFile: VOICE_SESSION_FILE, title: VOICE_TITLE }
+    );
+    return out;
+  } catch (e) {
+    if (process.env.JARVIS_DEBUG) {
+      console.error(`[voice] fast agent failed (${e.message}); escalating to jarvis`);
+    }
+    return "TASK";
+  }
+}
+
 async function transcribeBytes(wavBytes) {
   await ensureSpeech();
   const resp = await fetch(`http://127.0.0.1:${SPEECH_PORT}/transcribe`, {
@@ -396,24 +469,95 @@ async function speak(text) {
   return d.wav_b64;
 }
 
-// Turn a user utterance into a reply + piper audio (voice-mode prompt).
+// Turn a user utterance into a reply + piper audio. Routes chit-chat to the
+// lean jarvis-voice agent (with TASK self-escalation) and tasks to jarvis.
 async function handleUtterance(userText) {
   const t0 = Date.now();
-  const out = await runAgent(
-    `You are Jarvis in VOICE MODE. The user said: "${userText}". ` +
-      `Respond conversationally and briefly (1-3 short sentences), the way a voice assistant would. ` +
-      `Output ONLY a JSON object of the form {"reply": "your spoken reply"}. ` +
-      `Do NOT use any tools. Do NOT call "say". No markdown, no commentary, nothing else.`
-  );
+  let agent = "jarvis";
+  let reply;
+  if (isTaskRequest(userText)) {
+    reply = await runJarvisVoice(userText);
+  } else {
+    const fast = await runFastVoice(userText);
+    if (isTaskEscalation(fast)) {
+      reply = await runJarvisVoice(userText);
+    } else {
+      agent = "jarvis-voice";
+      reply = fast;
+    }
+  }
   const tAgent = Date.now();
-  const reply = await extractReply(out);
   const audioB64Reply = await speak(reply);
   if (process.env.JARVIS_DEBUG) {
     console.error(
-      `[utter] agent=${tAgent - t0}ms tts=${Date.now() - tAgent}ms total=${Date.now() - t0}ms`
+      `[utter] agent=${agent} llm=${tAgent - t0}ms tts=${Date.now() - tAgent}ms total=${Date.now() - t0}ms`
     );
   }
   return { reply, audioB64: audioB64Reply };
+}
+
+// ---------------------------------------------------------------- setup
+
+// Keep the lean voice agent installed (committed template -> ~/.config/opencode).
+function ensureVoiceAgent() {
+  const src = join(JARVIS_DIR, "server", "opencode-agents", "jarvis-voice.md");
+  const dest = join(HOME, ".config", "opencode", "agents", "jarvis-voice.md");
+  if (!existsSync(src)) return;
+  const content = readFileSync(src, "utf8");
+  if (existsSync(dest) && readFileSync(dest, "utf8") === content) return;
+  mkdirSync(dirname(dest), { recursive: true });
+  writeFileSync(dest, content, { mode: 0o600 });
+  if (process.env.JARVIS_DEBUG) console.error("[setup] installed jarvis-voice agent");
+}
+
+// Subtle two-tone reflex chime the client plays the instant the user submits.
+async function ensureChime() {
+  if (existsSync(CHIME_FILE)) return;
+  try {
+    await execFileAsync(
+      "ffmpeg",
+      [
+        "-y",
+        "-f", "lavfi", "-i", "sine=frequency=880:duration=0.12",
+        "-f", "lavfi", "-i", "sine=frequency=1174.66:duration=0.22",
+        "-filter_complex",
+        "[0:a]volume=0.35,afade=t=in:st=0:d=0.004,afade=t=out:st=0.08:d=0.04[a];" +
+          "[1:a]volume=0.3,afade=t=in:st=0:d=0.004,afade=t=out:st=0.16:d=0.06[b];" +
+          "[a][b]concat=n=2:v=0:a=1",
+        "-ar", "44100", "-ac", "1", CHIME_FILE,
+      ],
+      { timeout: 15000 }
+    );
+  } catch (e) {
+    if (process.env.JARVIS_DEBUG) console.error(`[setup] chime generation failed: ${e.message}`);
+  }
+}
+
+// Send a throwaway message to a warm session and revert it, so MCP/models are
+// pre-loaded and the first real request is fast without polluting history.
+async function warmSession(agent, sessionFile, title) {
+  const base = await spawnOcServer();
+  const sid = await ensureSession(sessionFile, title);
+  try {
+    const resp = await httpJson(`${base}/session/${sid}/message`, {
+      method: "POST",
+      auth: OC_AUTH,
+      body: { agent, parts: [{ type: "text", text: "Reply with exactly: OK" }] },
+      timeoutMs: 90000,
+    });
+    const messageID = resp && resp.info && resp.info.id;
+    if (messageID) {
+      await httpJson(`${base}/session/${sid}/revert`, {
+        method: "POST",
+        auth: OC_AUTH,
+        body: { messageID },
+        timeoutMs: 30000,
+      }).catch(() => {});
+    }
+    if (process.env.JARVIS_DEBUG) console.error(`[warm] ${agent} session ready`);
+  } catch (e) {
+    if (process.env.JARVIS_DEBUG) console.error(`[warm] ${agent} failed: ${e.message}`);
+  }
 }
 
 // ---------------------------------------------------------------- http
@@ -434,7 +578,13 @@ function auth(req, res, next) {
 }
 
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, session: readSessionId(), auth: true });
+  res.json({ ok: true, session: readSessionId(), voiceSession: readSessionId(VOICE_SESSION_FILE), auth: true });
+});
+
+// Reflex chime, public (it's just a sound).
+app.get("/chime.wav", (req, res) => {
+  if (!existsSync(CHIME_FILE)) return res.status(404).end();
+  res.sendFile(CHIME_FILE);
 });
 
 // Auto-login bootstrap: only reachable from the local machine.
@@ -491,6 +641,8 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`  Local URL:  http://localhost:${PORT}`);
   console.log(`  API token:  ${TOKEN}`);
   console.log(`  (token also in ${TOKEN_FILE}; pass in Authorization: Bearer <token>)`);
+  ensureVoiceAgent();
+  ensureChime();
   // Warm the helper servers in the background so the first request is fast.
   ensureSpeech()
     .then(() => {
@@ -500,6 +652,8 @@ app.listen(PORT, "0.0.0.0", () => {
   spawnOcServer()
     .then(() => {
       if (process.env.JARVIS_DEBUG) console.error("[warm] opencode serve ready");
+      warmSession("jarvis", SESSION_FILE, "jarvis daemon");
+      warmSession("jarvis-voice", VOICE_SESSION_FILE, VOICE_TITLE);
     })
     .catch((e) => console.error(`[warm] opencode serve failed: ${e.message}`));
 });
