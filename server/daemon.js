@@ -73,6 +73,7 @@ const OC_AUTH = "Basic " + Buffer.from(`opencode:${getOcPassword()}`).toString("
 
 const SERVER_DIR = join(JARVIS_DIR, "server");
 const MIC_FILE = join(STATE_DIR, "host-mic.wav");
+const MIC_SOURCE_FILE = join(STATE_DIR, "mic-source.json");
 
 function isLoopback(addr) {
   return (
@@ -85,6 +86,101 @@ function isLoopback(addr) {
 
 let micProc = null;
 let micTimer = null;
+
+// ----------------------------------------------------------------- mic source
+// The daemon records the desktop mic via ffmpeg + PulseAudio "default". If that
+// default source is a dead/headless mic it silently captures silence. Before
+// recording we therefore pick a real input source that is actually producing a
+// signal (probe via volumedetect), falling back to "default". Overridable with
+// JARVIS_MIC_SOURCE. Probing is cached briefly so tapping-to-record stays snappy.
+const MIC_SOURCE_TTL = 30000;
+let micSource = null; // resolved { name, ts }
+
+// The persisted mic choice ("auto" | "default" | an alsa_input device name).
+// Priority: JARVIS_MIC_SOURCE env > mic-source.json > "auto".
+async function micSetting() {
+  if (process.env.JARVIS_MIC_SOURCE) return process.env.JARVIS_MIC_SOURCE;
+  try {
+    const d = JSON.parse(readFileSync(MIC_SOURCE_FILE, "utf8"));
+    if (d && typeof d.source === "string" && d.source) return d.source;
+  } catch {}
+  return "auto";
+}
+
+async function listMicSources() {
+  try {
+    const { stdout } = await execFileAsync("pactl", ["list", "sources", "short"], {
+      timeout: 5000,
+    });
+    return stdout
+      .trim()
+      .split("\n")
+      .map((l) => l.split("\t"))
+      .filter((p) => p.length >= 2 && /^alsa_input\./.test(p[1]))
+      .filter((p) => !p[1].includes(".monitor"))
+      .map((p) => ({ name: p[1], state: p[4] || "" }));
+  } catch {
+    return [];
+  }
+}
+
+// Capture ~1.2s and return the peak volume in dB (low = silent/quiet).
+async function probeMicLevel(source) {
+  const tmp = join(STATE_DIR, "mic_probe.wav");
+  try {
+    await execFileAsync(
+      "ffmpeg",
+      ["-y", "-f", "pulse", "-i", source, "-t", "1.2", "-ac", "1", "-ar", "16000", tmp],
+      { timeout: 4000 }
+    );
+    const { stdout } = await execFileAsync(
+      "ffmpeg",
+      ["-hide_banner", "-i", tmp, "-af", "volumedetect", "-f", "null", "-"],
+      { timeout: 5000 }
+    );
+    const m = stdout.match(/max_volume:\s*(-?[\d.]+)\s*dB/);
+    return m ? parseFloat(m[1]) : -200;
+  } catch {
+    return -200;
+  }
+}
+
+async function resolveMicSource() {
+  const now = Date.now();
+  if (micSource && now - micSource.ts < MIC_SOURCE_TTL) return micSource.name;
+  const want = await micSetting();
+  let chosen = "default";
+  if (want !== "auto" && want !== "default") {
+    // An explicit device from env / config — probe it, but trust it if it has
+    // signal (get the real name); otherwise keep the explicit device anyway.
+    const db = await probeMicLevel(want);
+    if (process.env.JARVIS_DEBUG) {
+      console.error(`[mic] using configured ${want} (probe max=${db.toFixed(1)}dB)`);
+    }
+    chosen = want;
+  } else if (want === "auto") {
+    // Best-effort: probe candidates, prefer non-suspended inputs with signal.
+    const srcs = await listMicSources();
+    if (srcs.length) {
+      const ordered = [
+        ...srcs.filter((s) => s.state && s.state !== "SUSPENDED"),
+        ...srcs.filter((s) => !s.state || s.state === "SUSPENDED"),
+      ];
+      for (const s of ordered) {
+        const db = await probeMicLevel(s.name);
+        if (process.env.JARVIS_DEBUG) {
+          console.error(`[mic] auto probe ${s.name} max=${db.toFixed(1)}dB state=${s.state}`);
+        }
+        if (db >= -45) {
+          chosen = s.name;
+          break;
+        }
+      }
+    }
+  }
+  micSource = { name: chosen, ts: now };
+  return chosen;
+}
 
 function stopMic() {
   if (micTimer) {
@@ -1240,14 +1336,67 @@ app.get("/api/token", (req, res) => {
 
 // Start/stop daemon-side mic capture (used by the desktop widget, where
 // WebKitGTK denies getUserMedia). ffmpeg writes straight to 16k mono wav.
-app.post("/api/mic/start", auth, (req, res) => {
+// List selectable mic inputs and the current choice (for the widget dropdown).
+app.get("/api/mic/sources", auth, async (req, res) => {
+  const srcs = await listMicSources();
+  let setting = "auto";
+  let current = "default";
+  try {
+    setting = await micSetting();
+    current = await resolveMicSource();
+  } catch {}
+  res.json({
+    current,
+    setting,
+    sources: [{ name: "auto", label: "Auto detect", state: "" }, { name: "default", label: "Pulse default", state: "" }].concat(
+      srcs.map((s) => ({ name: s.name, label: s.name.replace(/^alsa_input\./, ""), state: s.state }))
+    ),
+  });
+});
+
+// Change which mic the daemon records from (runtime, no restart needed).
+app.post("/api/mic/source", auth, async (req, res) => {
+  const { source } = req.body || {};
+  if (typeof source !== "string" || !source) {
+    return res.status(400).json({ error: "source required" });
+  }
+  const srcs = await listMicSources();
+  const known =
+    source === "auto" ||
+    source === "default" ||
+    srcs.some((s) => s.name === source);
+  if (!known) return res.status(400).json({ error: "unknown source" });
+  try {
+    writeFileSync(MIC_SOURCE_FILE, JSON.stringify({ source, ts: Date.now() }), {
+      mode: 0o600,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+  micSource = null; // drop the cached resolved device
+  res.json({ setting: source });
+});
+
+app.post("/api/mic/start", auth, async (req, res) => {
   if (micProc) return res.status(409).json({ error: "already recording" });
+  let src = "default";
+  try {
+    src = await resolveMicSource();
+  } catch {}
+  if (process.env.JARVIS_DEBUG) console.error(`[mic] capturing via "${src}"`);
   micProc = spawn(
     "ffmpeg",
-    ["-y", "-f", "pulse", "-i", "default", "-af", "volume=8dB", "-ar", "16000", "-ac", "1", MIC_FILE],
+    ["-y", "-f", "pulse", "-i", src, "-af", "volume=8dB", "-ar", "16000", "-ac", "1", MIC_FILE],
     { stdio: "ignore" }
   );
   micProc.on("error", () => {
+    micProc = null;
+  });
+  micProc.on("exit", () => {
+    if (micTimer) {
+      clearTimeout(micTimer);
+      micTimer = null;
+    }
     micProc = null;
   });
   micTimer = setTimeout(() => {

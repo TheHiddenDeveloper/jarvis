@@ -338,6 +338,56 @@ function clearLog() {
 
 clearBtn.addEventListener("click", clearLog);
 
+// ---- mic selection (loopback only): which input device the daemon records. ----
+const micselWrap = document.getElementById("micsel");
+const micSel = document.getElementById("micSel");
+
+function showMicsel(shown) {
+  if (shown) micselWrap.classList.remove("hidden");
+  else micselWrap.classList.add("hidden");
+}
+
+async function loadMicSources() {
+  try {
+    await autoToken();
+  } catch {}
+  if (!token) return;
+  try {
+    const r = await fetch("/api/mic/sources", {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (r.status === 401) return;
+    const d = await r.json();
+    micSel.innerHTML = "";
+    (d.sources || []).forEach((s) => {
+      const o = document.createElement("option");
+      o.value = s.name;
+      let label = s.state ? `${s.label} (${s.state.toLowerCase()})` : s.label;
+      o.textContent = label;
+      micSel.appendChild(o);
+    });
+    if (d.setting) micSel.value = d.setting;
+    showMicsel(true);
+  } catch {}
+}
+
+micSel.addEventListener("change", async () => {
+  if (!token) return;
+  try {
+    const r = await fetch("/api/mic/source", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ source: micSel.value }),
+    });
+    if (r.status === 401) return showToken();
+    if (!r.ok) return;
+    await loadMicSources();
+  } catch {}
+});
+
 // ----------------------------------------------------------- core handlers
 // Cancel the in-flight generation: tell the daemon to abort (it closes the SSE
 // stream with a {type:"cancelled"} event), and force-close the local stream if
@@ -679,3 +729,7 @@ if ("serviceWorker" in navigator) {
 autoToken().then((ok) => {
   if (!ok && !token) showToken();
 });
+
+// The mic device dropdown only matters on the desktop widget (recording flows
+// through the local daemon there), so enable it on loopback.
+if (IS_LOCAL) loadMicSources();

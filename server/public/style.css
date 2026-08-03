@@ -260,7 +260,7 @@ main {
   gap: 4px;
   min-height: 0;
 }
-.loghead { display: flex; justify-content: flex-end; }
+.loghead { display: flex; justify-content: flex-end; align-items: center; gap: 8px; }
 .clear {
   border: none;
   background: transparent;
@@ -274,6 +274,24 @@ main {
 }
 .clear:hover { color: var(--text); }
 .clear.hidden { display: none; }
+.micsel {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.micsel select {
+  max-width: 160px;
+  background: #1b2026;
+  color: var(--text);
+  border: 1px solid #2a2f3a;
+  border-radius: 6px;
+  font-size: 11px;
+  padding: 1px 4px;
+}
+.micsel select:hover { border-color: #3a4150; }
+.micsel.hidden { display: none; }
 
 .log {
   flex: 1;
