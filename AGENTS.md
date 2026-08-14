@@ -24,10 +24,12 @@ This is the central context file for the Jarvis personal assistant. It tells the
 - **Hands (MCP servers):**
   - `filesystem` — file read/write/search across allowed roots.
   - `playwright` — browser automation (research, forms, downloads).
-  - `jarvis-tools` — desktop control (typing/keys, screenshots + OCR, clipboard), notifications, TTS, memory access.
+  - `jarvis-tools` — desktop control (typing/keys, screenshots + OCR, clipboard), notifications, TTS, memory access, vision (`see_screen`, `click_on`), screen learning (`record_landmark`, `save_procedure`), and a knowledge graph (`graph_recall`, `graph_reindex`).
+  - `ai-vision-mcp` — Gemini vision "eyes": image/video analysis, object detection, design audits.
 - **Memory — two layers:**
-  - **Canonical brain:** the Obsidian vault at `~/Ideaverse` (knowledge base). Tools: `vault_read`, `vault_search`, `vault_search_semantic` (local embeddings, meaning-based), `vault_write`, `vault_context`, `vault_log`. Run `vault_context` at session start; `vault_log` after completing work there.
+  - **Canonical brain:** the Obsidian vault at `~/Ideaverse` (knowledge base). Tools: `vault_read`, `vault_search`, `vault_search_semantic` (local embeddings, meaning-based), `vault_write`, `vault_context`, `vault_log`. Run `vault_context` at session start; `vault_log` after completing work there. This is the **human's** vault — never write Jarvis operational/screen knowledge into it.
   - **Fast layer:** `~/jarvis/memory/` (operational state). Tools: `memory_read/write/search`. Reference vault notes rather than duplicating them.
+- **Own vault (screen learning + knowledge graph):** `~/jarvis/vault/` — Jarvis's private Obsidian vault. `Procedures/` (multi-step SOPs via `save_procedure`), `Screen/Landmarks.md` (stable element positions via `record_landmark`/`click_on name=`), `Knowledge/`. Read `~/jarvis/vault/AGENTS.md`. Use the screen-learning loop for multi-step desktop tasks: **Recall → Orient → Execute/Verify → Learn**. Recall uses `graph_recall` (Personalized PageRank over the note graph in `~/jarvis/state/jarvis-kg.json`, built by `~/jarvis/scripts/jarvis-kg.py`); after learning, `graph_reindex`. See `~/.config/opencode/agents/jarvis.md` for the full loop.
 - **Front doors:** CLI (`jarvis` command), scheduled cron jobs, remote web UI, voice (Phase 2+).
 
 ## Operating Rules

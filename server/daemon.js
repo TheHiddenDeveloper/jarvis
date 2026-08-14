@@ -484,6 +484,16 @@ function friendlyActivity(toolName, input) {
     [/^github_/, () => "Checking GitHub"],
     [/(^|_)notify$/, () => "Sending you a notification"],
     [/(^|_)say$|tts/, () => "Speaking"],
+    [/(^|_)see_screen$|(^|_)screenshot$/, () => "Looking at your screen"],
+    [/(^|_)record_landmark$/, () => "Remembering a screen location" + q("name")],
+    [/(^|_)save_procedure$/, () => "Saving a procedure" + q("title")],
+    [/(^|_)graph_recall$/, () => "Recalling what I know" + q("query")],
+    [/(^|_)graph_reindex$/, () => "Updating my knowledge graph"],
+    [/(^|_)click_on$|mouse_move|mouse_click/, () => "Clicking on your screen" + q("prompt")],
+    [/(^|_)ocr_image$|(^|_)ocr$/, () => "Reading text from your screen" + q("path")],
+    [/analyze_image|detect_objects_in_image|compare_images/, () => "Analyzing an image" + q("prompt", "path")],
+    [/audit_design/, () => "Reviewing a design" + q("prompt", "path")],
+    [/analyze_video/, () => "Analyzing a video" + q("prompt", "path")],
   ];
   for (const [re, fn] of rules) if (re.test(name)) return fn();
   return "Working on that";
@@ -694,6 +704,9 @@ const TASK_RE = [
   /\b(restart|reboot|shutdown|sleep|lock|power off)\b/,
   /\b(volume|brightness|screenshot|notification|notify|remind|reminder|timer|alarm|schedule|calendar|email|message|call)\b/,
   /\b(weather|forecast|temperature|wifi|bluetooth|network|time|date)\b/,
+  // Vision / desktop: "what's on my screen", "look at the window", "click the wifi icon"
+  /\b(see|look at|what'?s? on|what is on|describe|show me|take a look)\b.*\b(screen|display|desktop|monitor|window)\b/,
+  /\bwhat do you see\b|\bwhat are you (looking at|seeing)\b|\b(click|tap)\b/,
 ];
 
 function isTaskRequest(text) {

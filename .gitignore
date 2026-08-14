@@ -28,3 +28,8 @@ models/
 
 # Playwright MCP snapshots
 .playwright-mcp/
+
+# Vendored MCP server clone (manifests only tracked)
+mcp/ai-vision-mcp/*
+!mcp/ai-vision-mcp/package.json
+!mcp/ai-vision-mcp/package-lock.json

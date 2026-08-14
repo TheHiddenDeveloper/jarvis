@@ -1,0 +1,2 @@
+
+- [2026-08-09] 2026-08-09: HyprMod setup complete. Keybind SUPER+I (kbSettings var) added in ~/.config/hypr/variables.lua + keybinds.lua -> `hyprmod`. HyprMod 0.4.0 is a Python GTK4/libadwaita app; window takes ~4s to appear after launch (normal). Temp sudoers rule /etc/sudoers.d/opencode-temp removed. NOTE: HyprMod is ML4W's app built for their config — it reads/writes standard hyprland.conf style config, NOT Caelestia's Lua configs; may show empty settings or not apply changes to Caelestia. Verify before relying on it.
