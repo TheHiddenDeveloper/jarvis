@@ -26,8 +26,11 @@ const VOICE_SESSION_FILE = join(STATE_DIR, "voice-session.id");
 const VOICE_TITLE = "jarvis voice";
 const CHIME_FILE = join(STATE_DIR, "chime.wav");
 const TOKEN_FILE = join(STATE_DIR, "server.token");
-const VENV_PY = join(JARVIS_DIR, "venv/bin/python");
-const OPENCODE = process.env.OPENCODE_BIN || "opencode";
+const VENV_PY = join(JARVIS_DIR, "venv", "Scripts", "python.exe");
+const OPENCODE = process.env.OPENCODE_BIN || (process.platform === "win32" ? "opencode.cmd" : "opencode");
+// Windows can't exec a .cmd directly via child_process.spawn (throws EINVAL);
+// it must be routed through the shell. No-op on POSIX.
+const OPENCODE_SPAWN = process.platform === "win32" ? { shell: true } : {};
 const PORT = Number(process.env.JARVIS_PORT || 7878);
 // Resuming an existing session takes a while; if it yields nothing (e.g. the
 // session's directory no longer matches our cwd) we drop the id and retry fresh
@@ -58,7 +61,7 @@ mkdirSync(STATE_DIR, { recursive: true });
 function getToken() {
   if (existsSync(TOKEN_FILE)) return readFileSync(TOKEN_FILE, "utf8").trim();
   const token = randomBytes(24).toString("hex");
-  writeFileSync(TOKEN_FILE, token, { mode: 0o600 });
+  writeFileSync(TOKEN_FILE, token);
   return token;
 }
 const TOKEN = process.env.JARVIS_API_TOKEN || getToken();
@@ -66,7 +69,7 @@ const TOKEN = process.env.JARVIS_API_TOKEN || getToken();
 function getOcPassword() {
   if (existsSync(OC_PASSWORD_FILE)) return readFileSync(OC_PASSWORD_FILE, "utf8").trim();
   const p = randomBytes(16).toString("hex");
-  writeFileSync(OC_PASSWORD_FILE, p, { mode: 0o600 });
+  writeFileSync(OC_PASSWORD_FILE, p);
   return p;
 }
 const OC_AUTH = "Basic " + Buffer.from(`opencode:${getOcPassword()}`).toString("base64");
@@ -88,15 +91,14 @@ let micProc = null;
 let micTimer = null;
 
 // ----------------------------------------------------------------- mic source
-// The daemon records the desktop mic via ffmpeg + PulseAudio "default". If that
-// default source is a dead/headless mic it silently captures silence. Before
-// recording we therefore pick a real input source that is actually producing a
+// The daemon records the desktop mic via ffmpeg + DirectShow. Before
+// recording we pick a real input source that is actually producing a
 // signal (probe via volumedetect), falling back to "default". Overridable with
 // JARVIS_MIC_SOURCE. Probing is cached briefly so tapping-to-record stays snappy.
 const MIC_SOURCE_TTL = 30000;
 let micSource = null; // resolved { name, ts }
 
-// The persisted mic choice ("auto" | "default" | an alsa_input device name).
+// The persisted mic choice ("auto" | "default" | a DirectShow device name).
 // Priority: JARVIS_MIC_SOURCE env > mic-source.json > "auto".
 async function micSetting() {
   if (process.env.JARVIS_MIC_SOURCE) return process.env.JARVIS_MIC_SOURCE;
@@ -109,16 +111,22 @@ async function micSetting() {
 
 async function listMicSources() {
   try {
-    const { stdout } = await execFileAsync("pactl", ["list", "sources", "short"], {
-      timeout: 5000,
-    });
-    return stdout
-      .trim()
-      .split("\n")
-      .map((l) => l.split("\t"))
-      .filter((p) => p.length >= 2 && /^alsa_input\./.test(p[1]))
-      .filter((p) => !p[1].includes(".monitor"))
-      .map((p) => ({ name: p[1], state: p[4] || "" }));
+    const { stdout } = await execFileAsync("ffmpeg", [
+      "-f", "dshow", "-list_devices", "true", "-i", "dummy",
+    ], { timeout: 5000, windowsHide: true });
+    const sources = [];
+    const re = /^\[dshow @ [^\]]+\]\s+"([^"]+)"\s*$/gm;
+    let m;
+    let inAudio = false;
+    for (const line of stdout.split("\n")) {
+      if (line.includes("DirectShow audio devices")) inAudio = true;
+      if (line.includes("DirectShow video devices")) inAudio = false;
+      if (inAudio) {
+        const dm = line.match(/"([^"]+)"/);
+        if (dm) sources.push({ name: dm[1], state: "" });
+      }
+    }
+    return sources;
   } catch {
     return [];
   }
@@ -130,13 +138,13 @@ async function probeMicLevel(source) {
   try {
     await execFileAsync(
       "ffmpeg",
-      ["-y", "-f", "pulse", "-i", source, "-t", "1.2", "-ac", "1", "-ar", "16000", tmp],
-      { timeout: 4000 }
+      ["-y", "-f", "dshow", "-i", `audio=${source}`, "-t", "1.2", "-ac", "1", "-ar", "16000", tmp],
+      { timeout: 4000, windowsHide: true }
     );
     const { stdout } = await execFileAsync(
       "ffmpeg",
       ["-hide_banner", "-i", tmp, "-af", "volumedetect", "-f", "null", "-"],
-      { timeout: 5000 }
+      { timeout: 5000, windowsHide: true }
     );
     const m = stdout.match(/max_volume:\s*(-?[\d.]+)\s*dB/);
     return m ? parseFloat(m[1]) : -200;
@@ -159,17 +167,13 @@ async function resolveMicSource() {
     }
     chosen = want;
   } else if (want === "auto") {
-    // Best-effort: probe candidates, prefer non-suspended inputs with signal.
+    // Best-effort: probe candidates, prefer devices with signal.
     const srcs = await listMicSources();
     if (srcs.length) {
-      const ordered = [
-        ...srcs.filter((s) => s.state && s.state !== "SUSPENDED"),
-        ...srcs.filter((s) => !s.state || s.state === "SUSPENDED"),
-      ];
-      for (const s of ordered) {
+      for (const s of srcs) {
         const db = await probeMicLevel(s.name);
         if (process.env.JARVIS_DEBUG) {
-          console.error(`[mic] auto probe ${s.name} max=${db.toFixed(1)}dB state=${s.state}`);
+          console.error(`[mic] auto probe ${s.name} max=${db.toFixed(1)}dB`);
         }
         if (db >= -45) {
           chosen = s.name;
@@ -216,6 +220,7 @@ function runOpencode(args, timeoutMs = 180000) {
       cwd: SERVER_DIR,
       stdio: ["ignore", "pipe", "pipe"],
       env: process.env,
+      ...OPENCODE_SPAWN,
     });
     let out = "";
     child.stdout.on("data", (d) => (out += d));
@@ -331,6 +336,7 @@ async function spawnOcServer({ force = false } = {}) {
     cwd: SERVER_DIR,
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, OPENCODE_SERVER_PASSWORD: getOcPassword() },
+    ...OPENCODE_SPAWN,
   });
   ocProc.on("exit", () => {
     ocProc = null;
@@ -973,7 +979,7 @@ function scheduleCacheSave() {
   cacheSaveTimer = setTimeout(() => {
     cacheSaveTimer = null;
     try {
-      writeFileSync(CACHE_FILE, JSON.stringify(replyCache), { mode: 0o600 });
+      writeFileSync(CACHE_FILE, JSON.stringify(replyCache));
     } catch {}
   }, 2000);
 }
@@ -1152,7 +1158,7 @@ function ensureVoiceAgent() {
   const content = readFileSync(src, "utf8");
   if (existsSync(dest) && readFileSync(dest, "utf8") === content) return;
   mkdirSync(dirname(dest), { recursive: true });
-  writeFileSync(dest, content, { mode: 0o600 });
+  writeFileSync(dest, content);
   if (process.env.JARVIS_DEBUG) console.error("[setup] installed jarvis-voice agent");
 }
 
@@ -1361,8 +1367,8 @@ app.get("/api/mic/sources", auth, async (req, res) => {
   res.json({
     current,
     setting,
-    sources: [{ name: "auto", label: "Auto detect", state: "" }, { name: "default", label: "Pulse default", state: "" }].concat(
-      srcs.map((s) => ({ name: s.name, label: s.name.replace(/^alsa_input\./, ""), state: s.state }))
+    sources: [{ name: "auto", label: "Auto detect", state: "" }, { name: "default", label: "Default device", state: "" }].concat(
+      srcs.map((s) => ({ name: s.name, label: s.name, state: s.state }))
     ),
   });
 });
@@ -1380,9 +1386,7 @@ app.post("/api/mic/source", auth, async (req, res) => {
     srcs.some((s) => s.name === source);
   if (!known) return res.status(400).json({ error: "unknown source" });
   try {
-    writeFileSync(MIC_SOURCE_FILE, JSON.stringify({ source, ts: Date.now() }), {
-      mode: 0o600,
-    });
+    writeFileSync(MIC_SOURCE_FILE, JSON.stringify({ source, ts: Date.now() }));
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }
@@ -1399,8 +1403,8 @@ app.post("/api/mic/start", auth, async (req, res) => {
   if (process.env.JARVIS_DEBUG) console.error(`[mic] capturing via "${src}"`);
   micProc = spawn(
     "ffmpeg",
-    ["-y", "-f", "pulse", "-i", src, "-af", "volume=8dB", "-ar", "16000", "-ac", "1", MIC_FILE],
-    { stdio: "ignore" }
+    ["-y", "-f", "dshow", "-i", `audio=${src}`, "-af", "volume=8dB", "-ar", "16000", "-ac", "1", MIC_FILE],
+    { stdio: "ignore", windowsHide: true }
   );
   micProc.on("error", () => {
     micProc = null;

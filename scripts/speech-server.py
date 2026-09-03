@@ -26,7 +26,10 @@ os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 WHISPER_MODEL = os.environ.get("JARVIS_WHISPER_MODEL", "base")
 PIPER_MODEL = os.environ.get(
-    "JARVIS_PIPER_MODEL", os.path.expanduser("~/jarvis/models/piper/en_US-lessac-medium.onnx")
+    "JARVIS_PIPER_MODEL",
+    os.path.expanduser("~/jarvis/models/piper/en_US-lessac-medium.onnx")
+    if os.name != "nt"
+    else os.path.join(os.environ.get("USERPROFILE", "~"), "jarvis", "models", "piper", "en_US-lessac-medium.onnx")
 )
 EMBED_MODEL = os.environ.get("JARVIS_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 PORT = int(os.environ.get("JARVIS_SPEECH_PORT", "7888"))

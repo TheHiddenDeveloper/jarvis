@@ -58,7 +58,7 @@ Or open the web UI / desktop widget: daemon serves `http://localhost:7878`.
 | `mcp/filesystem/` | Official filesystem MCP |
 | `mcp/playwright/` | Browser automation MCP |
 | `server/` | Node/express daemon + PWA (`server/public/`) |
-| `scripts/setup-deps.sh` | System dependency installer (Manjaro/Arch) |
+| `deploy/` | Per-platform launch tooling. **Convention:** shared runtime stays in `server/` + `scripts/`; anything OS-specific lives in `deploy/windows/` or `deploy/linux/` (see `deploy/README.md`) |
 | `scripts/transcribe.py` | faster-whisper transcription (one-shot) |
 | `scripts/speech-server.py` | Warm ASR+TTS server: whisper + piper loaded once, HTTP (`:7888`) |
 | `widget/` | Tauri 2 desktop widget (frameless, always-on-top) |
@@ -70,7 +70,7 @@ Requires: Manjaro/Arch (or similar), Wayland/KDE, Node 20+, Rust/cargo, Python v
 ### 1. System deps
 
 ```sh
-bash scripts/setup-deps.sh        # wtype grim slurp wl-clipboard ydotool tesseract, mic gain, input group
+bash deploy/linux/setup-deps.sh   # wtype grim slurp wl-clipboard ydotool tesseract, mic gain, input group
 sudo pacman -S --needed ffmpeg espeak-ng
 # Tauri widget: cargo, webkit2gtk-4.1, gtk3, libsoup3, librsvg
 ```

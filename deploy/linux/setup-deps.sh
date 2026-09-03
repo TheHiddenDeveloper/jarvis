@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Jarvis system dependency setup (Manjaro/Arch + Wayland).
-# Run once:  bash ~/jarvis/scripts/setup-deps.sh
+# Run once:  bash ~/jarvis/deploy/linux/setup-deps.sh
 set -euo pipefail
 
 echo "==> Installing Wayland automation tools (requires sudo)"

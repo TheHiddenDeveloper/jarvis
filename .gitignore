@@ -33,3 +33,6 @@ models/
 mcp/ai-vision-mcp/*
 !mcp/ai-vision-mcp/package.json
 !mcp/ai-vision-mcp/package-lock.json
+
+# Runtime logs (may contain token/bootstrap output)
+logs/

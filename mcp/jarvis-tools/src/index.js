@@ -38,7 +38,7 @@ function loadEnv() {
 
 function has(cmd) {
   try {
-    execSync(`command -v ${cmd}`, { stdio: "ignore" });
+    execSync(`where.exe ${cmd}`, { stdio: "ignore", windowsHide: true });
     return true;
   } catch {
     return false;
@@ -59,12 +59,7 @@ function writeReminders(list) {
   writeFileSync(REMINDERS_FILE, JSON.stringify(list, null, 2));
 }
 
-const uid = process.getuid?.() ?? "";
 const graphicalEnv = {
-  XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR || `/run/user/${uid}`,
-  WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY || process.env.DISPLAY || "wayland-0",
-  DBUS_SESSION_BUS_ADDRESS:
-    process.env.DBUS_SESSION_BUS_ADDRESS || `unix:path=/run/user/${uid}/bus`,
   ...process.env,
 };
 
@@ -73,37 +68,34 @@ function run(cmd, args = [], opts = {}) {
     encoding: "utf8",
     timeout: 20000,
     env: graphicalEnv,
+    windowsHide: true,
     ...opts,
   });
 }
 
 function captureScreenshot(region = false) {
   const file = join(SCREENSHOT_DIR, `shot-${Date.now()}.png`);
-  let ok = false;
-  if (has("spectacle")) {
-    const args = ["-b", "-n", "-o", file];
-    if (region) args.unshift("-r");
-    try {
-      run("spectacle", args);
-      ok = true;
-    } catch {
-      ok = false;
-    }
-  }
-  if (!ok && has("grim")) {
-    try {
-      if (region && has("slurp")) {
-        const area = run("slurp").trim();
-        run("grim", ["-g", area, file]);
-      } else {
-        run("grim", [file]);
-      }
-      ok = true;
-    } catch {
-      ok = false;
-    }
-  }
-  return ok ? file : null;
+  try {
+    // Use PowerShell to capture the full screen
+    const psScript = `
+      Add-Type -AssemblyName System.Windows.Forms
+      Add-Type -AssemblyName System.Drawing
+      $screen = [System.Windows.Forms.Screen]::PrimaryScreen
+      $bitmap = New-Object System.Drawing.Bitmap($screen.Bounds.Width, $screen.Bounds.Height)
+      $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+      $graphics.CopyFromScreen($screen.Bounds.Location, [System.Drawing.Point]::Empty, $screen.Bounds.Size)
+      $bitmap.Save('${file.replace(/\\/g, "\\\\")}')
+      $graphics.Dispose()
+      $bitmap.Dispose()
+    `;
+    execFileSync("powershell", ["-NoProfile", "-Command", psScript], {
+      stdio: "ignore",
+      timeout: 10000,
+      windowsHide: true,
+    });
+    if (existsSync(file)) return file;
+  } catch {}
+  return null;
 }
 
 function pngDimensions(file) {
@@ -160,11 +152,8 @@ server.tool(
   "Full-text search across all Jarvis memory topic files.",
   { query: z.string().describe("Search text") },
   async ({ query }) => {
-    if (!has("rg")) {
-      return { content: [{ type: "text", text: "rg not installed; cannot search." }] };
-    }
     try {
-      const out = run("rg", ["-il", query, MEMORY_DIR]);
+      const out = run("findstr", ["/s", "/i", "/m", query, join(MEMORY_DIR, "*.md")]);
       return { content: [{ type: "text", text: out || "No matches." }] };
     } catch {
       return { content: [{ type: "text", text: "No matches." }] };
@@ -180,7 +169,7 @@ server.tool(
 function vaultResolve(notePath) {
   // Accept an absolute or vault-relative path. Reject traversal outside the vault.
   let p = resolve(VAULT_DIR, notePath);
-  if (!p.startsWith(VAULT_DIR + "/") && p !== VAULT_DIR) {
+  if (!p.startsWith(VAULT_DIR + "\\") && !p.startsWith(VAULT_DIR + "/") && p !== VAULT_DIR) {
     throw new Error(`Path escapes the vault: ${notePath}`);
   }
   return p;
@@ -290,12 +279,16 @@ server.tool(
     if (!existsSync(full)) {
       // fall back to a vault-wide search for a note with that base name
       const base = safeVaultName(p.split("/").pop().replace(/\.md$/, ""));
-      const found = run("rg", ["-l", `(?i)^#.*${base}|${base}`, VAULT_DIR]).trim();
-      if (!found) {
+      try {
+        const found = run("findstr", ["/s", "/i", "/m", base, join(VAULT_DIR, "*.md")]).trim();
+        if (!found) {
+          return { content: [{ type: "text", text: `Note not found: ${p}` }] };
+        }
+        const hit = found.split("\n")[0];
+        return { content: [{ type: "text", text: readFileSync(hit, "utf8") }] };
+      } catch {
         return { content: [{ type: "text", text: `Note not found: ${p}` }] };
       }
-      const hit = found.split("\n")[0];
-      return { content: [{ type: "text", text: readFileSync(hit, "utf8") }] };
     }
     return { content: [{ type: "text", text: readFileSync(full, "utf8") }] };
   }
@@ -306,13 +299,12 @@ server.tool(
   "Full-text search across the Obsidian vault (~/Ideaverse). Returns matching file paths (and line numbers). Excludes .obsidian and .git internals.",
   { query: z.string().describe("Search text or regex"), max: z.number().int().min(1).max(50).describe("Max results to return").optional() },
   async ({ query, max = 15 }) => {
-    if (!has("rg")) return { content: [{ type: "text", text: "rg not installed; cannot search." }] };
     try {
-      const out = run("rg", ["-il", "--glob", "!.obsidian/**", "--glob", "!.git/**", query, VAULT_DIR]);
+      const out = run("findstr", ["/s", "/i", "/m", query, join(VAULT_DIR, "*.md")]);
       const lines = out.split("\n").filter(Boolean);
       const hits = lines.slice(0, max);
       const text = hits.length
-        ? hits.map((h) => h.replace(VAULT_DIR + "/", "")).join("\n")
+        ? hits.map((h) => h.replace(VAULT_DIR + "\\", "").replace(VAULT_DIR + "/", "")).join("\n")
         : "No matches.";
       return { content: [{ type: "text", text: text }] };
     } catch {
@@ -330,7 +322,7 @@ server.tool(
     min_score: z.number().min(0).max(1).describe("Minimum similarity score (0-1). Lower = more results.").optional(),
   },
   async ({ query, k = 5, min_score = 0.2 }) => {
-    const py = join(JARVIS_DIR, "venv", "bin", "python");
+    const py = join(JARVIS_DIR, "venv", "Scripts", "python.exe");
     const script = join(JARVIS_DIR, "scripts", "vault-embed.py");
     if (!existsSync(py) || !existsSync(script)) {
       return { content: [{ type: "text", text: "Semantic search not set up (venv or vault-embed.py missing)." }] };
@@ -381,13 +373,24 @@ server.tool(
   "Print a snapshot of the vault state (tasks, daily note, reports) using the vault's own context-bridge. Run at session start before working in the vault.",
   {},
   async () => {
-    const bridge = join(VAULT_AGENTS, "context-bridge.sh");
-    if (!existsSync(bridge)) return { content: [{ type: "text", text: "context-bridge.sh not found." }] };
-    try {
-      return { content: [{ type: "text", text: run("bash", [bridge]) }] };
-    } catch (e) {
-      return { content: [{ type: "text", text: `context-bridge failed: ${e.message}` }] };
+    // On Windows, read vault state directly instead of calling bash scripts
+    const lines = [];
+    const today = new Date().toISOString().slice(0, 10);
+    const dailyNote = join(VAULT_DIR, "DailyNotes", `${today}.md`);
+    if (existsSync(dailyNote)) {
+      lines.push("## Today's Daily Note");
+      lines.push(readFileSync(dailyNote, "utf8").slice(0, 2000));
     }
+    // Check for task files
+    const inboxDir = join(VAULT_DIR, "Inbox");
+    if (existsSync(inboxDir)) {
+      const tasks = readdirSync(inboxDir).filter(f => f.endsWith(".md")).slice(0, 10);
+      if (tasks.length) {
+        lines.push("\n## Inbox");
+        lines.push(tasks.join("\n"));
+      }
+    }
+    return { content: [{ type: "text", text: lines.join("\n") || "Vault context loaded (no daily note found)." }] };
   }
 );
 
@@ -401,20 +404,18 @@ server.tool(
     knowledge: z.string().describe("Anything learned or any errors overcome").optional(),
   },
   async ({ title, desc, mutations = "None", knowledge = "None" }) => {
-    const logger = join(VAULT_AGENTS, "execution-logger.sh");
-    if (!existsSync(logger)) return { content: [{ type: "text", text: "execution-logger.sh not found." }] };
-    try {
-      const out = run("bash", [
-        logger,
-        `--title=${title}`,
-        `--desc=${desc}`,
-        `--mutations=${mutations}`,
-        `--knowledge=${knowledge}`,
-      ]);
-      return { content: [{ type: "text", text: out }] };
-    } catch (e) {
-      return { content: [{ type: "text", text: `vault_log failed: ${e.message}` }] };
+    // On Windows, log execution directly instead of calling bash scripts
+    const today = new Date().toISOString().slice(0, 10);
+    const dailyDir = join(VAULT_DIR, "DailyNotes");
+    mkdirSync(dailyDir, { recursive: true });
+    const dailyNote = join(dailyDir, `${today}.md`);
+    const entry = `\n### ${new Date().toLocaleTimeString()} - ${title}\n${desc}\nFiles: ${mutations}\nLearned: ${knowledge}\n`;
+    if (existsSync(dailyNote)) {
+      appendFileSync(dailyNote, entry);
+    } else {
+      writeFileSync(dailyNote, `# ${today}\n${entry}`);
     }
+    return { content: [{ type: "text", text: `Logged "${title}" to ${today}.md` }] };
   }
 );
 
@@ -424,10 +425,10 @@ server.tool(
   "Report OS, session type, and availability of automation tools.",
   {},
   async () => {
-    const checks = ["wtype", "grim", "slurp", "tesseract", "wl-copy", "wl-paste", "notify-send", "espeak-ng", "ffmpeg", "ntfy"];
+    const checks = ["tesseract", "ffmpeg", "ffplay", "curl", "where", "powershell"];
     const info = checks.map((c) => `${c}=${has(c) ? "yes" : "no"}`).join("\n");
-    const os = run("bash", ["-c", "uname -a"], { stdio: "pipe" }).trim();
-    return { content: [{ type: "text", text: `OS: ${os}\nSession: ${process.env.XDG_SESSION_TYPE ?? "?"}\nTools:\n${info}` }] };
+    const os = run("powershell", ["-NoProfile", "-Command", "[System.Environment]::OSVersion.VersionString"], { stdio: "pipe" }).trim();
+    return { content: [{ type: "text", text: `OS: ${os}\nPlatform: Windows\nTools:\n${info}` }] };
   }
 );
 
@@ -436,22 +437,17 @@ server.tool(
   "Launch an application by name (uses kde-open / gtk-launch / flatpak).",
   { app: z.string().describe("Application name, e.g. 'brave', 'obsidian', 'kate'") },
   async ({ app }) => {
-    const cmds = [
-      ["kde-open", app],
-      ["gtk-launch", app],
-      ["flatpak", "run", app],
-    ];
-    for (const [cmd, ...args] of cmds) {
-      if (has(cmd)) {
-        try {
-          execFileSync(cmd, args, { stdio: "ignore", timeout: 10000 });
-          return { content: [{ type: "text", text: `Launched ${app} via ${cmd}.` }] };
-        } catch {
-          /* try next */
-        }
-      }
+    try {
+      // On Windows, try Start-Process or shell:appsfolder
+      execSync(`powershell -NoProfile -Command "Start-Process '${app.replace(/'/g, "''")}'"`, {
+        stdio: "ignore",
+        timeout: 10000,
+        windowsHide: true,
+      });
+      return { content: [{ type: "text", text: `Launched ${app}.` }] };
+    } catch {
+      return { content: [{ type: "text", text: `Could not launch "${app}".` }] };
     }
-    return { content: [{ type: "text", text: `Could not launch "${app}".` }] };
   }
 );
 
@@ -461,9 +457,14 @@ server.tool(
   "Type text into the focused window (Wayland: wtype).",
   { text: z.string().describe("Text to type") },
   async ({ text }) => {
-    if (!has("wtype")) return { content: [{ type: "text", text: "wtype not installed." }] };
-    run("wtype", ["--", text]);
-    return { content: [{ type: "text", text: `Typed ${text.length} chars.` }] };
+    try {
+      // Use PowerShell SendKeys for typing on Windows
+      const psScript = `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait("${text.replace(/"/g, '\\"').replace(/'/g, "''")}")`;
+      execSync(`powershell -NoProfile -Command "${psScript}"`, { stdio: "ignore", timeout: 5000, windowsHide: true });
+      return { content: [{ type: "text", text: `Typed ${text.length} chars.` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `Type failed: ${e.message}` }] };
+    }
   }
 );
 
@@ -472,9 +473,36 @@ server.tool(
   "Send a keyboard shortcut to the focused window, e.g. 'ctrl+c', 'Return', 'alt+Tab'.",
   { key: z.string().describe("Key combination, e.g. 'ctrl+c' or 'Return'") },
   async ({ key }) => {
-    if (!has("wtype")) return { content: [{ type: "text", text: "wtype not installed." }] };
-    run("wtype", ["-k", key]);
-    return { content: [{ type: "text", text: `Pressed ${key}.` }] };
+    try {
+      // Map common key names to Windows SendKeys format
+      const keyMap = {
+        "Return": "{ENTER}", "enter": "{ENTER}",
+        "BackSpace": "{BACKSPACE}", "backspace": "{BACKSPACE}",
+        "Tab": "{TAB}", "tab": "{TAB}",
+        "Escape": "{ESC}", "escape": "{ESC}", "esc": "{ESC}",
+        "Delete": "{DELETE}", "delete": "{DELETE}",
+        "Up": "{UP}", "up": "{UP}",
+        "Down": "{DOWN}", "down": "{DOWN}",
+        "Left": "{LEFT}", "left": "{LEFT}",
+        "Right": "{RIGHT}", "right": "{RIGHT}",
+        "Home": "{HOME}", "home": "{HOME}",
+        "End": "{END}", "end": "{END}",
+        "Page_Up": "{PGUP}", "PageUp": "{PGUP}",
+        "Page_Down": "{PGDN}", "PageDown": "{PGDN}",
+        "F1": "{F1}", "F2": "{F2}", "F3": "{F3}", "F4": "{F4}",
+        "F5": "{F5}", "F6": "{F6}", "F7": "{F7}", "F8": "{F8}",
+        "F9": "{F9}", "F10": "{F10}", "F11": "{F11}", "F12": "{F12}",
+        "ctrl+c": "^c", "ctrl+v": "^v", "ctrl+x": "^x", "ctrl+z": "^z",
+        "ctrl+a": "^a", "ctrl+s": "^s", "ctrl+f": "^f",
+        "alt+Tab": "%{TAB}", "alt+tab": "%{TAB}",
+      };
+      const mapped = keyMap[key] || `{${key}}`;
+      const psScript = `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait("${mapped}")`;
+      execSync(`powershell -NoProfile -Command "${psScript}"`, { stdio: "ignore", timeout: 5000, windowsHide: true });
+      return { content: [{ type: "text", text: `Pressed ${key}.` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `Key press failed: ${e.message}` }] };
+    }
   }
 );
 
@@ -483,9 +511,14 @@ server.tool(
   "Move the mouse pointer to absolute screen coordinates (ydotool). Needs the ydotool daemon running.",
   { x: z.number().describe("X coordinate"), y: z.number().describe("Y coordinate") },
   async ({ x, y }) => {
-    if (!has("ydotool")) return { content: [{ type: "text", text: "ydotool not installed." }] };
-    run("ydotool", ["mousemove", "--absolute", "--x", String(x), "--y", String(y)]);
-    return { content: [{ type: "text", text: `Moved pointer to (${x}, ${y}).` }] };
+    try {
+      // Use PowerShell with System.Windows.Forms for mouse movement
+      const psScript = `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(${x}, ${y})`;
+      execSync(`powershell -NoProfile -Command "${psScript}"`, { stdio: "ignore", timeout: 5000, windowsHide: true });
+      return { content: [{ type: "text", text: `Moved pointer to (${x}, ${y}).` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `Mouse move failed: ${e.message}` }] };
+    }
   }
 );
 
@@ -497,16 +530,30 @@ server.tool(
     count: z.number().int().describe("Number of clicks").default(1),
   },
   async ({ button, count }) => {
-    if (!has("ydotool")) return { content: [{ type: "text", text: "ydotool not installed." }] };
-    const codes = { left: "0xC0", right: "0xC1", middle: "0xC2" };
-    run("ydotool", ["click", codes[button], String(count)]);
-    return { content: [{ type: "text", text: `Clicked ${button} x${count}.` }] };
+    try {
+      const downMap = { left: "0x02", right: "0x08", middle: "0x20" };
+      const upMap = { left: "0x04", right: "0x10", middle: "0x40" };
+      const down = downMap[button];
+      const up = upMap[button];
+      const psScript = "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class MouseOps { [DllImport(\"user32.dll\")] public static extern void mouse_event(int dwFlags, int dx, int dy, int dwData, int dwExtraInfo); }'; " +
+        "$d = " + down + "; $u = " + up + "; " +
+        "for ($i = 0; $i -lt " + count + "; $i++) { " +
+        "[MouseOps]::mouse_event($d, 0, 0, 0, 0); " +
+        "[MouseOps]::mouse_event($u, 0, 0, 0, 0); " +
+        "Start-Sleep -Milliseconds 50 }";
+      execSync('powershell -NoProfile -Command "' + psScript.replace(/"/g, '\\"') + '"', {
+        stdio: "ignore", timeout: 5000, windowsHide: true,
+      });
+      return { content: [{ type: "text", text: "Clicked " + button + " x" + count + "." }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: "Click failed: " + e.message }] };
+    }
   }
 );
 
 server.tool(
   "screenshot",
-  "Capture the screen (full or region). On KDE uses Spectacle (native); grim as fallback. Optionally run OCR on it with tesseract. Returns the saved image path and any OCR text.",
+  "Capture the screen (full). On Windows uses PowerShell with System.Drawing. Optionally run OCR on it with tesseract. Returns the saved image path and any OCR text.",
   {
     region: z.boolean().describe("If true, capture a rectangular region (interactive selection on KDE; slurp on other compositors). Default: full screen.").optional(),
     ocr: z.boolean().describe("Run OCR on the capture. Default: false.").optional(),
@@ -697,7 +744,7 @@ server.tool(
     k: z.number().int().min(1).max(10).describe("Max results to return").optional(),
   },
   async ({ query, k = 5 }) => {
-    const py = join(JARVIS_DIR, "venv", "bin", "python");
+    const py = join(JARVIS_DIR, "venv", "Scripts", "python.exe");
     const script = join(JARVIS_DIR, "scripts", "jarvis-kg.py");
     if (!existsSync(py) || !existsSync(script)) {
       return { content: [{ type: "text", text: "Knowledge graph not set up (venv or jarvis-kg.py missing)." }] };
@@ -726,7 +773,7 @@ server.tool(
   "Rebuild/refresh the Jarvis knowledge graph index (picks up new/edited procedures, landmarks, and memory notes incrementally by mtime). Run this after saving new knowledge so graph_recall sees it. Use force to rebuild everything from scratch.",
   { force: z.boolean().describe("Rebuild all embeddings from scratch (slower). Default: incremental.").optional() },
   async ({ force = false }) => {
-    const py = join(JARVIS_DIR, "venv", "bin", "python");
+    const py = join(JARVIS_DIR, "venv", "Scripts", "python.exe");
     const script = join(JARVIS_DIR, "scripts", "jarvis-kg.py");
     if (!existsSync(py) || !existsSync(script)) {
       return { content: [{ type: "text", text: "Knowledge graph not set up (venv or jarvis-kg.py missing)." }] };
@@ -743,9 +790,9 @@ server.tool(
 );
 
 server.tool("clipboard_get", "Read the current clipboard text.", {}, async () => {
-  if (!has("wl-paste")) return { content: [{ type: "text", text: "wl-paste not installed." }] };
   try {
-    return { content: [{ type: "text", text: run("timeout", ["3", "wl-paste"], { timeout: 8000 }) }] };
+    const text = run("powershell", ["-NoProfile", "-Command", "Get-Clipboard"], { stdio: "pipe" });
+    return { content: [{ type: "text", text: text || "(clipboard empty)" }] };
   } catch {
     return { content: [{ type: "text", text: "(clipboard empty or non-text)" }] };
   }
@@ -756,13 +803,18 @@ server.tool(
   "Set the clipboard to the given text.",
   { text: z.string().describe("Text to put on the clipboard") },
   async ({ text }) => {
-    if (!has("wl-copy")) return { content: [{ type: "text", text: "wl-copy not installed." }] };
-    execFileSync("wl-copy", [], {
-      input: text,
-      stdio: ["pipe", "ignore", "ignore"],
-      env: graphicalEnv,
-    });
-    return { content: [{ type: "text", text: "Clipboard set." }] };
+    try {
+      // Use clip.exe for setting clipboard on Windows
+      const proc = execSync(`clip.exe`, {
+        input: text,
+        stdio: ["pipe", "ignore", "ignore"],
+        timeout: 5000,
+        windowsHide: true,
+      });
+      return { content: [{ type: "text", text: "Clipboard set." }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `Clipboard set failed: ${e.message}` }] };
+    }
   }
 );
 
@@ -777,13 +829,32 @@ server.tool(
   },
   async ({ title, message, phone = false }) => {
     const results = [];
-    if (has("notify-send")) {
-      try {
-        run("notify-send", [title, message]);
-        results.push("desktop: sent");
-      } catch (e) {
-        results.push(`desktop: failed (${e.stderr?.toString().trim() || e.message})`);
-      }
+    // Windows toast notification
+    try {
+      const psScript = `
+        [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+        [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime] | Out-Null
+        $template = @"
+        <toast>
+          <visual>
+            <binding template="ToastGeneric">
+              <text>${title.replace(/"/g, '\\"')}</text>
+              <text>${message.replace(/"/g, '\\"')}</text>
+            </binding>
+          </visual>
+        </toast>
+"@
+        $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+        $xml.LoadXml($template)
+        $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("Jarvis").Show($toast)
+      `;
+      execSync(`powershell -NoProfile -Command "${psScript.replace(/"/g, '\\"').replace(/\n/g, ' ')}"`, {
+        stdio: "ignore", timeout: 5000, windowsHide: true,
+      });
+      results.push("desktop: sent");
+    } catch (e) {
+      results.push(`desktop: failed (${e.message})`);
     }
     if (phone) {
       const env = loadEnv();
@@ -811,21 +882,25 @@ server.tool(
   async () => {
     const out = [];
     try {
-      out.push("### Disk\n" + run("df", ["-h", "/", "--exclude", "tmpfs", "--exclude", "devtmpfs"]).trim());
+      const disk = run("powershell", ["-NoProfile", "-Command", "Get-PSDrive -PSProvider FileSystem | Select-Object Name,@{N='Used(GB)';E={[math]::Round($_.Used/1GB,1)}},@{N='Free(GB)';E={[math]::Round($_.Free/1GB,1)}} | Format-Table -AutoSize"], { stdio: "pipe" }).trim();
+      out.push("### Disk\n" + disk);
     } catch (e) { out.push(`disk: ${e.message}`); }
     try {
-      out.push("### Memory\n" + run("free", ["-h"]).trim());
+      const mem = run("powershell", ["-NoProfile", "-Command", "$os = Get-CimInstance Win32_OperatingSystem; Write-Host ('Total: {0:N1} GB' -f ($os.TotalVisibleMemorySize/1MB)); Write-Host ('Free: {0:N1} GB' -f ($os.FreePhysicalMemory/1MB)); Write-Host ('Used: {0:N1} GB' -f (($os.TotalVisibleMemorySize - $os.FreePhysicalMemory)/1MB))"], { stdio: "pipe" }).trim();
+      out.push("### Memory\n" + mem);
     } catch (e) { out.push(`memory: ${e.message}`); }
     try {
-      out.push("### Uptime\n" + run("uptime").trim());
+      const boot = run("powershell", ["-NoProfile", "-Command", "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime"], { stdio: "pipe" }).trim();
+      out.push("### Uptime\nLast boot: " + boot);
     } catch (e) { out.push(`uptime: ${e.message}`); }
     try {
-      const failed = run("systemctl", ["--failed", "--no-legend", "--no-pager"]).trim();
-      out.push("### Failed units\n" + (failed ? failed : "none"));
-    } catch (e) { out.push(`systemctl: ${e.message}`); }
+      const failed = run("powershell", ["-NoProfile", "-Command", "Get-Service | Where-Object {$_.Status -ne 'Running' -and $_.StartType -eq 'Automatic'} | Select-Object Name,Status | Format-Table -AutoSize"], { stdio: "pipe" }).trim();
+      out.push("### Failed services\n" + (failed ? failed : "none"));
+    } catch (e) { out.push(`services: ${e.message}`); }
     try {
-      const upd = run("pacman", ["-Qu"], { timeout: 60000 }).split("\n").filter(Boolean);
-      out.push(`### Updates\n${upd.length ? upd.length + " available (see pkg_updates)" : "up to date"}`);
+      const upd = run("winget", ["list", "--upgradable"], { timeout: 60000 });
+      const lines = upd.split("\n").filter(l => l.trim() && !l.startsWith("Name") && !l.startsWith("---"));
+      out.push(`### Updates\n${lines.length ? lines.length + " available" : "up to date"}`);
     } catch (e) { out.push(`updates: ${e.message}`); }
     return { content: [{ type: "text", text: out.join("\n\n") }] };
   }
@@ -837,8 +912,9 @@ server.tool(
   { limit: z.number().int().min(1).max(100).describe("Max packages to list").optional() },
   async ({ limit = 20 }) => {
     try {
-      const out = run("pacman", ["-Qu"], { timeout: 60000 }).split("\n").filter(Boolean);
-      const shown = out.slice(0, limit);
+      const out = run("winget", ["list", "--upgradable"], { timeout: 60000 });
+      const lines = out.split("\n").filter(l => l.trim() && !l.startsWith("Name") && !l.startsWith("---") && !l.startsWith("Upgrade"));
+      const shown = lines.slice(0, limit);
       return { content: [{ type: "text", text: shown.join("\n") || "No updates available." }] };
     } catch (e) {
       return { content: [{ type: "text", text: `Could not check updates: ${e.message}` }] };
@@ -954,27 +1030,19 @@ server.tool(
     attach: z.string().describe("Absolute path to a file to attach").optional(),
   },
   async ({ to, subject, body, cc, bcc, html = false, attach }) => {
-    if (!has("msmtp")) return { content: [{ type: "text", text: "msmtp not installed." }] };
     const env = loadEnv();
-    const from = env.MSMTP_FROM;
-    const account = msmtpAccount();
-    let msg = `From: ${from || "Jarvis"}\nTo: ${to}\nSubject: ${subject}\n`;
-    if (cc) msg += `Cc: ${cc}\n`;
-    if (bcc) msg += `Bcc: ${bcc}\n`;
-    msg += `Content-Type: ${html ? "text/html" : "text/plain"}; charset=utf-8\n\n${body}\n`;
+    const from = env.MSMTP_FROM || env.SMTP_FROM || "";
     try {
-      const args = ["-a", account];
-      if (from) args.push("--from", from);
-      if (attach) args.push("--attach", attach);
-      execFileSync("msmtp", [...args, ...to.split(",").map((s) => s.trim())], {
-        input: msg,
-        stdio: ["pipe", "ignore", "ignore"],
-        env: graphicalEnv,
-        timeout: 30000,
-      });
-      return { content: [{ type: "text", text: `Email sent to ${to} via msmtp (account ${account}).` }] };
+      // Use PowerShell Send-MailMessage on Windows
+      const params = ["-NoProfile", "-Command", `Send-MailMessage -To '${to}' -Subject '${subject.replace(/'/g, "''")}' -Body '${body.replace(/'/g, "''")}' -SmtpServer '${env.SMTP_SERVER || "smtp.gmail.com"}' -Port ${env.SMTP_PORT || 587} -UseSsl`];
+      if (from) params[2] += ` -From '${from}'`;
+      if (cc) params[2] += ` -Cc '${cc}'`;
+      if (bcc) params[2] += ` -Bcc '${bcc}'`;
+      if (attach) params[2] += ` -Attachments '${attach}'`;
+      execSync(`powershell ${params.map(p => `"${p}"`).join(" ")}`, { stdio: "ignore", timeout: 30000, windowsHide: true });
+      return { content: [{ type: "text", text: `Email sent to ${to}.` }] };
     } catch (e) {
-      return { content: [{ type: "text", text: `Email failed: ${e.stderr?.toString() || e.message}` }] };
+      return { content: [{ type: "text", text: `Email failed: ${e.message}` }] };
     }
   }
 );
@@ -984,15 +1052,13 @@ server.tool(
   "Check whether msmtp is configured (~/.config/msmtp/config + account) and report sendable status.",
   {},
   async () => {
-    const cfg = join(HOME, ".config", "msmtp", "config");
     const env = loadEnv();
     const lines = [];
-    lines.push(`msmtp: ${has("msmtp") ? "installed" : "MISSING"}`);
-    lines.push(`config file: ${existsSync(cfg) ? "present" : "MISSING (~/.config/msmtp/config)"}`);
-    lines.push(`account: ${msmtpAccount()}`);
-    lines.push(`from: ${env.MSMTP_FROM || "not set (MSMTP_FROM in ~/jarvis/.env)"}`);
-    const ready = has("msmtp") && existsSync(cfg) && env.MSMTP_FROM;
-    lines.push(`status: ${ready ? "READY" : "need config (see setup docs)"}`);
+    lines.push(`SMTP server: ${env.SMTP_SERVER || "not set (set SMTP_SERVER in ~/jarvis/.env)"}`);
+    lines.push(`SMTP port: ${env.SMTP_PORT || "not set (set SMTP_PORT in ~/jarvis/.env)"}`);
+    lines.push(`From: ${env.MSMTP_FROM || env.SMTP_FROM || "not set (set SMTP_FROM in ~/jarvis/.env)"}`);
+    const ready = env.SMTP_SERVER && (env.MSMTP_FROM || env.SMTP_FROM);
+    lines.push(`status: ${ready ? "READY" : "need config (set SMTP_SERVER, SMTP_FROM, SMTP_PORT in ~/jarvis/.env)"}`);
     return { content: [{ type: "text", text: lines.join("\n") }] };
   }
 );
@@ -1006,15 +1072,27 @@ server.tool(
     calendar: z.string().describe("Restrict to one calendar name").optional(),
   },
   async ({ days = 7, calendar }) => {
-    if (!has("khal")) return { content: [{ type: "text", text: "khal not installed." }] };
     try {
-      const args = ["list"];
-      if (calendar) args.push("-a", calendar);
-      args.push("today", `${days}d`);
-      const out = run("khal", args, { timeout: 30000 });
+      // Use Outlook COM on Windows
+      const psScript = `
+        $outlook = New-Object -ComObject Outlook.Application
+        $ns = $outlook.GetNamespace("MAPI")
+        $folder = $ns.GetDefaultFolder(6) # olFolderCalendar
+        $items = $folder.Items
+        $items.Sort("[Start]")
+        $items.IncludeRecurrences = $true
+        $start = Get-Date
+        $end = $start.AddDays(${days})
+        $filter = "[Start] >= '{0}' AND [Start] <= '{1}'" -f $start.ToString("g"), $end.ToString("g")
+        $restricted = $items.Restrict($filter)
+        foreach ($item in $restricted) {
+          Write-Host ("{0} - {1}: {2}" -f $item.Start.ToString("g"), $item.Duration.ToString(), $item.Subject)
+        }
+      `;
+      const out = run("powershell", ["-NoProfile", "-Command", psScript], { stdio: "pipe", timeout: 30000 });
       return { content: [{ type: "text", text: out.trim() || "(no events)" }] };
     } catch (e) {
-      return { content: [{ type: "text", text: `calendar failed: ${e.stderr?.toString() || e.message}` }] };
+      return { content: [{ type: "text", text: `calendar failed: ${e.message}` }] };
     }
   }
 );
@@ -1031,18 +1109,24 @@ server.tool(
     calendar: z.string().describe("Calendar to use (default: first configured)").optional(),
   },
   async ({ date, summary, end, location, description, calendar }) => {
-    if (!has("khal")) return { content: [{ type: "text", text: "khal not installed." }] };
     try {
-      const args = ["new"];
-      if (calendar) args.push("-a", calendar);
-      if (location) args.push("-l", location);
-      const when = end ? `${date} ${end}` : date;
-      const text = description ? `${summary} :: ${description}` : summary;
-      args.push("--", ...when.split(" "), text);
-      const out = run("khal", args, { timeout: 30000 });
-      return { content: [{ type: "text", text: out.trim() || "Event added. Run calendar_sync to push it to the external." }] };
+      // Use Outlook COM on Windows
+      const endDate = end || date;
+      const psScript = `
+        $outlook = New-Object -ComObject Outlook.Application
+        $appt = $outlook.CreateItem(1) # olAppointmentItem
+        $appt.Subject = '${summary.replace(/'/g, "''")}'
+        $appt.Start = '${date}'
+        $appt.End = '${endDate}'
+        ${location ? `$appt.Location = '${location.replace(/'/g, "''")}'` : ""}
+        ${description ? `$appt.Body = '${description.replace(/'/g, "''")}'` : ""}
+        $appt.Save()
+        Write-Host "Event created: $summary"
+      `;
+      const out = run("powershell", ["-NoProfile", "-Command", psScript], { stdio: "pipe", timeout: 30000 });
+      return { content: [{ type: "text", text: out.trim() || "Event added via Outlook." }] };
     } catch (e) {
-      return { content: [{ type: "text", text: `calendar_add failed: ${e.stderr?.toString() || e.message}` }] };
+      return { content: [{ type: "text", text: `calendar_add failed: ${e.message}` }] };
     }
   }
 );
@@ -1052,13 +1136,8 @@ server.tool(
   "Synchronize calendars via vdirsyncer (CalDAV). Run after adding events on another device, or before calendar_next.",
   {},
   async () => {
-    if (!has("vdirsyncer")) return { content: [{ type: "text", text: "vdirsyncer not installed." }] };
-    try {
-      const out = run("vdirsyncer", ["sync"], { timeout: 120000 });
-      return { content: [{ type: "text", text: out.trim() || "Synced." }] };
-    } catch (e) {
-      return { content: [{ type: "text", text: `sync failed: ${e.stderr?.toString() || e.message}` }] };
-    }
+    // On Windows, Outlook handles sync automatically via Exchange/ActiveSync
+    return { content: [{ type: "text", text: "Outlook on Windows syncs automatically via Exchange/ActiveSync. No manual sync needed." }] };
   }
 );
 
@@ -1067,17 +1146,17 @@ server.tool(
   "Check whether khal/vdirsyncer are configured (config files + storage).",
   {},
   async () => {
-    const khalCfg = join(HOME, ".config", "khal", "config");
-    const vdsCfg = join(HOME, ".config", "vdirsyncer", "config");
-    const calPath = join(HOME, ".local", "share", "calendars");
     const lines = [];
-    lines.push(`khal: ${has("khal") ? "installed" : "MISSING"}`);
-    lines.push(`vdirsyncer: ${has("vdirsyncer") ? "installed" : "MISSING"}`);
-    lines.push(`khal config: ${existsSync(khalCfg) ? "present" : "MISSING (~/.config/khal/config)"}`);
-    lines.push(`vdirsyncer config: ${existsSync(vdsCfg) ? "present" : "MISSING (~/.config/vdirsyncer/config)"}`);
-    lines.push(`calendar storage: ${existsSync(calPath) && readdirSync(calPath).length ? readdirSync(calPath).join(", ") : "empty (~/.local/share/calendars)"}`);
-    const ready = has("khal") && has("vdirsyncer") && existsSync(khalCfg) && existsSync(vdsCfg);
-    lines.push(`status: ${ready ? "READY" : "needs config (see setup docs)"}`);
+    try {
+      // Check if Outlook is installed
+      const psScript = `if (Test-Path "HKLM:\\SOFTWARE\\Microsoft\\Office\\*\\Outlook") { Write-Host "installed" } else { Write-Host "not found" }`;
+      const result = run("powershell", ["-NoProfile", "-Command", psScript], { stdio: "pipe" }).trim();
+      lines.push(`Outlook: ${result === "installed" ? "installed" : "not found"}`);
+      lines.push(`status: ${result === "installed" ? "READY (uses Outlook COM)" : "Outlook not detected"}`);
+    } catch (e) {
+      lines.push(`Outlook check failed: ${e.message}`);
+      lines.push("status: unknown");
+    }
     return { content: [{ type: "text", text: lines.join("\n") }] };
   }
 );
@@ -1142,14 +1221,27 @@ server.tool(
     const tts = env.JARVIS_TTS || "piper";
     if (tts === "edge") {
       if (!has("edge-tts")) return { content: [{ type: "text", text: "edge-tts not installed." }] };
-      run("edge-tts", ["--voice", "en-US-ChristopherNeural", "--text", text, "--write-media", "/tmp/jarvis-tts.mp3"]);
-      execFileSync("ffplay", ["-nodisp", "-autoexit", "/tmp/jarvis-tts.mp3"], { stdio: "ignore" });
+      const tmpMp3 = join(STATE_DIR, "jarvis-tts.mp3");
+      run("edge-tts", ["--voice", "en-US-ChristopherNeural", "--text", text, "--write-media", tmpMp3]);
+      execFileSync("ffplay", ["-nodisp", "-autoexit", tmpMp3], { stdio: "ignore", windowsHide: true });
       return { content: [{ type: "text", text: "Spoke (edge-tts)." }] };
     }
-    const sayScript = join(JARVIS_DIR, "bin", "say.sh");
+    // Default: use piper via the speech server or direct CLI
+    const piperExe = join(JARVIS_DIR, "venv", "Scripts", "piper.exe");
+    const sayScript = join(JARVIS_DIR, "bin", "say.ps1");
+    if (existsSync(sayScript)) {
+      try {
+        execFileSync("powershell", ["-NoProfile", "-File", sayScript, text], { stdio: "ignore", timeout: 60000, windowsHide: true });
+        return { content: [{ type: "text", text: "Spoke (piper)." }] };
+      } catch (e) {
+        return { content: [{ type: "text", text: `TTS failed: ${e.message}` }] };
+      }
+    }
+    // Fallback: use Windows built-in speech synthesis
     try {
-      execFileSync(sayScript, [text], { stdio: "ignore", timeout: 60000 });
-      return { content: [{ type: "text", text: "Spoke (piper)." }] };
+      const psScript = `Add-Type -AssemblyName System.Speech; $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer; $synth.Speak('${text.replace(/'/g, "''")}')`;
+      execSync(`powershell -NoProfile -Command "${psScript}"`, { stdio: "ignore", timeout: 30000, windowsHide: true });
+      return { content: [{ type: "text", text: "Spoke (Windows TTS)." }] };
     } catch (e) {
       return { content: [{ type: "text", text: `TTS failed: ${e.message}` }] };
     }
